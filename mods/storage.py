@@ -10,15 +10,47 @@ SQL store).  It handles:
     and fall back to D1; writes go to both.
   - Direct SQL access via ``execute`` / ``fetchall`` / ``fetchone``.
   - A background task that periodically syncs ``sync:*`` Redis keys to D1.
+  - Declarative table-schema definition with column types, constraints, and
+    foreign keys via :class:`TableSchema` / :class:`ColumnDef` /
+    :class:`ForeignKey` and :meth:`DataStore.define_table`.
 
 Typical usage
 -------------
 ::
 
-    from mods.storage import init_storage, get_storage, close_storage
+    from mods.storage import (
+        init_storage, get_storage, close_storage,
+        ColumnDef, ForeignKey, TableSchema,
+    )
 
     # --- start-up ---
     store = await init_storage()          # reads all config from .env
+
+    # enable FK enforcement (once per connection)
+    await store.enable_foreign_keys()
+
+    # define tables
+    await store.define_table(TableSchema(
+        name="users",
+        columns=[
+            ColumnDef("id",       "INTEGER", primary_key=True, autoincrement=True),
+            ColumnDef("username", "TEXT",    not_null=True, unique=True),
+            ColumnDef("created_at", "TEXT",  default="datetime('now')"),
+        ],
+    ))
+
+    await store.define_table(TableSchema(
+        name="messages",
+        columns=[
+            ColumnDef("id",      "INTEGER", primary_key=True, autoincrement=True),
+            ColumnDef("user_id", "INTEGER", not_null=True),
+            ColumnDef("content", "TEXT",    not_null=True),
+        ],
+        foreign_keys=[
+            ForeignKey(column="user_id", ref_table="users", ref_column="id",
+                       on_delete="CASCADE"),
+        ],
+    ))
 
     # cache-aside read (Redis → D1 fallback)
     value = await store.get("user:42:name")
@@ -36,6 +68,7 @@ Typical usage
 import asyncio
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
@@ -58,6 +91,140 @@ _RETRY_BACKOFF = 1.0          # seconds between D1 retry attempts
 _SYNC_KEY_PREFIX = "sync:"    # Redis keys with this prefix are synced to D1
 _D1_SYNC_TABLE = "redis_cache"
 _DEFAULT_SYNC_INTERVAL = 60   # seconds
+
+
+# ---------------------------------------------------------------------------
+# Schema definition helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ColumnDef:
+    """Definition of a single D1 / SQLite column.
+
+    Parameters
+    ----------
+    name:
+        Column name.
+    type:
+        SQLite type affinity: ``"TEXT"``, ``"INTEGER"``, ``"REAL"``,
+        ``"BLOB"``, or ``"NUMERIC"``.
+    primary_key:
+        Mark this column as the PRIMARY KEY.
+    autoincrement:
+        Add ``AUTOINCREMENT`` (only valid for ``INTEGER PRIMARY KEY``).
+    not_null:
+        Add a ``NOT NULL`` constraint.
+    unique:
+        Add a ``UNIQUE`` constraint.
+    default:
+        Raw SQL expression for the column default, e.g. ``"0"``,
+        ``"'active'"``, or ``"datetime('now')"``.
+    """
+
+    name: str
+    type: str
+    primary_key: bool = False
+    autoincrement: bool = False
+    not_null: bool = False
+    unique: bool = False
+    default: Optional[str] = None
+
+    def to_sql(self) -> str:
+        """Return the SQL fragment for this column definition."""
+        parts = [self.name, self.type]
+        if self.primary_key:
+            parts.append("PRIMARY KEY")
+            if self.autoincrement:
+                parts.append("AUTOINCREMENT")
+        if self.not_null:
+            parts.append("NOT NULL")
+        if self.unique:
+            parts.append("UNIQUE")
+        if self.default is not None:
+            parts.append(f"DEFAULT {self.default}")
+        return " ".join(parts)
+
+
+@dataclass
+class ForeignKey:
+    """A FOREIGN KEY constraint on one column of a table.
+
+    Parameters
+    ----------
+    column:
+        The local column that holds the foreign key.
+    ref_table:
+        The referenced (parent) table.
+    ref_column:
+        The referenced column in the parent table.
+    on_delete:
+        Action when the referenced row is deleted.
+        One of ``"NO ACTION"`` (default), ``"RESTRICT"``, ``"CASCADE"``,
+        ``"SET NULL"``, ``"SET DEFAULT"``.
+    on_update:
+        Action when the referenced key is updated (same options).
+    """
+
+    column: str
+    ref_table: str
+    ref_column: str
+    on_delete: str = "NO ACTION"
+    on_update: str = "NO ACTION"
+
+    def to_sql(self) -> str:
+        """Return the SQL fragment for this FOREIGN KEY constraint."""
+        return (
+            f"FOREIGN KEY ({self.column}) "
+            f"REFERENCES {self.ref_table} ({self.ref_column}) "
+            f"ON DELETE {self.on_delete} "
+            f"ON UPDATE {self.on_update}"
+        )
+
+
+@dataclass
+class TableSchema:
+    """Declarative schema for a single D1 / SQLite table.
+
+    Parameters
+    ----------
+    name:
+        Table name.
+    columns:
+        Ordered list of :class:`ColumnDef` objects.
+    foreign_keys:
+        List of :class:`ForeignKey` constraints.  Requires FK enforcement
+        to be active (call :meth:`DataStore.enable_foreign_keys` before
+        DML that needs cascading behaviour).
+
+    Example
+    -------
+    ::
+
+        TableSchema(
+            name="orders",
+            columns=[
+                ColumnDef("id",      "INTEGER", primary_key=True, autoincrement=True),
+                ColumnDef("user_id", "INTEGER", not_null=True),
+                ColumnDef("total",   "REAL",    not_null=True, default="0.0"),
+                ColumnDef("status",  "TEXT",    not_null=True, default="'pending'"),
+            ],
+            foreign_keys=[
+                ForeignKey("user_id", "users", "id", on_delete="CASCADE"),
+            ],
+        )
+    """
+
+    name: str
+    columns: list[ColumnDef]
+    foreign_keys: list[ForeignKey] = field(default_factory=list)
+
+    def to_ddl(self) -> str:
+        """Return a ``CREATE TABLE IF NOT EXISTS`` statement for this schema."""
+        col_parts = [col.to_sql() for col in self.columns]
+        fk_parts = [fk.to_sql() for fk in self.foreign_keys]
+        all_parts = col_parts + fk_parts
+        joined = ",\n    ".join(all_parts)
+        return f"CREATE TABLE IF NOT EXISTS {self.name} (\n    {joined}\n)"
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +447,7 @@ class DataStore:
         ]
         if missing:
             logger.warning(
-                "D1 not configured — missing env vars: %s", ", ".join(missing)
+                "D1 not configured — %d required env var(s) not set", len(missing)
             )
             self.d1_available = False
             return
@@ -655,6 +822,70 @@ class DataStore:
         """Return the first D1 result row, or *None* if empty."""
         rows = await self.execute(sql, params)
         return rows[0] if rows else None
+
+    async def enable_foreign_keys(self) -> None:
+        """Enable SQLite foreign-key enforcement for the current D1 session.
+
+        Cloudflare D1 is built on SQLite, which disables foreign-key
+        enforcement by default.  Call this method once after connecting (or
+        whenever you need cascading deletes / updates to take effect).
+
+        .. note::
+            D1 currently applies ``PRAGMA`` statements per-query rather than
+            per-connection; call this before any DML that relies on FK
+            cascading behaviour.
+        """
+        await self._d1_request("PRAGMA foreign_keys = ON")
+        logger.info("D1 foreign-key enforcement enabled")
+
+    async def define_table(self, schema: TableSchema) -> None:
+        """Create a D1 table from a :class:`TableSchema` if it does not exist.
+
+        Builds and executes a ``CREATE TABLE IF NOT EXISTS`` DDL statement that
+        includes all column definitions and any FOREIGN KEY constraints
+        declared in *schema*.
+
+        Parameters
+        ----------
+        schema:
+            The :class:`TableSchema` describing the table to create.
+
+        Example
+        -------
+        ::
+
+            await store.enable_foreign_keys()
+
+            await store.define_table(TableSchema(
+                name="users",
+                columns=[
+                    ColumnDef("id",       "INTEGER", primary_key=True, autoincrement=True),
+                    ColumnDef("username", "TEXT",    not_null=True, unique=True),
+                ],
+            ))
+
+            await store.define_table(TableSchema(
+                name="posts",
+                columns=[
+                    ColumnDef("id",      "INTEGER", primary_key=True, autoincrement=True),
+                    ColumnDef("user_id", "INTEGER", not_null=True),
+                    ColumnDef("body",    "TEXT",    not_null=True),
+                ],
+                foreign_keys=[
+                    ForeignKey("user_id", "users", "id", on_delete="CASCADE"),
+                ],
+            ))
+        """
+        ddl = schema.to_ddl()
+        logger.debug("Defining table '%s':\n%s", schema.name, ddl)
+        await self._d1_request(ddl)
+        logger.info(
+            "Table '%s' defined (%d columns, %d FK%s)",
+            schema.name,
+            len(schema.columns),
+            len(schema.foreign_keys),
+            "s" if len(schema.foreign_keys) != 1 else "",
+        )
 
 
 # ---------------------------------------------------------------------------

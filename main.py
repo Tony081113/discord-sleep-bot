@@ -4,7 +4,7 @@ Discord bot entry point.
 Responsibilities
 ----------------
 1. Load configuration from .env
-2. Initialise mods (logger, D1 database, Redis)
+2. Initialise mods (logger, unified storage: Redis + D1)
 3. Attach Redis handler to all loggers
 4. Log into Discord
 5. Load all cogs from the ``cogs/`` directory
@@ -23,8 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from mods.logger import attach_redis, setup_logger, get_configured_logger_names
-from mods.database import init_db, close_db
-from mods.redis_client import init_redis, close_redis
+from mods.storage import init_storage, close_storage
 
 logger = setup_logger(__name__)
 
@@ -76,48 +75,32 @@ async def load_cogs() -> None:
 
 async def init_mods() -> None:
     """Initialise all mods in the correct order."""
-    # 1. Database (D1)
     try:
-        await init_db()
-        logger.info("D1 database initialised")
+        store = await init_storage()
+        logger.info(
+            "Storage initialised (redis=%s, d1=%s)",
+            store.redis_available,
+            store.d1_available,
+        )
+
+        # Attach a synchronous Redis handler to all configured loggers.
+        # A synchronous client is required because logging.Handler.emit
+        # cannot await coroutines.
+        if store.redis_available:
+            sync_redis = store.get_sync_redis_client()
+            for name in get_configured_logger_names():
+                attach_redis(name, sync_redis)
+
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to initialise D1 database: %s", exc, exc_info=True)
-
-    # 2. Redis
-    try:
-        from mods.database import get_db
-        db = get_db()
-    except RuntimeError:
-        db = None
-
-    try:
-        redis_client = await init_redis(db_client=db)
-        logger.info("Redis initialised")
-
-        # Attach a synchronous Redis handler to all configured loggers so that
-        # log records are also stored in Redis.  A synchronous client is used
-        # because logging.Handler.emit cannot await coroutines.
-        sync_redis = redis_client.get_sync_client()
-        for name in get_configured_logger_names():
-            attach_redis(name, sync_redis)
-
-        # Start background D1 sync task only if DB is available
-        if db is not None:
-            redis_client.start_sync_task()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to initialise Redis: %s", exc, exc_info=True)
+        logger.error("Failed to initialise storage: %s", exc, exc_info=True)
 
 
 async def shutdown_mods() -> None:
     """Gracefully shut down all mods."""
     try:
-        await close_redis()
+        await close_storage()
     except Exception as exc:  # noqa: BLE001
-        logger.error("Error closing Redis: %s", exc)
-    try:
-        await close_db()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Error closing D1 database: %s", exc)
+        logger.error("Error closing storage: %s", exc)
 
 
 # ---------------------------------------------------------------------------

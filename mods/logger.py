@@ -148,7 +148,7 @@ def get_configured_logger_names() -> list[str]:
     return list(_configured_loggers)
 
 
-
+def attach_redis(logger_name: str, redis_client) -> None:
     """Attach a Redis handler to an already-configured logger.
 
     Useful when the Redis connection is established after the logger has
