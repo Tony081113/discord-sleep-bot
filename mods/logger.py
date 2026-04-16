@@ -152,9 +152,16 @@ def attach_redis(logger_name: str, redis_client) -> None:
     """Attach a Redis handler to an already-configured logger.
 
     Useful when the Redis connection is established after the logger has
-    been set up (e.g. during bot start-up).
+    been set up (e.g. during bot start-up).  Safe to call multiple times —
+    a second handler is not added if one is already attached.
     """
     logger = _configured_loggers.get(logger_name) or logging.getLogger(logger_name)
+
+    # Guard against duplicates when called more than once (e.g. on reconnect).
+    for handler in logger.handlers:
+        if isinstance(handler, _RedisLogHandler):
+            return
+
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",

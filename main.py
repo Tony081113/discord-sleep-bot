@@ -112,10 +112,13 @@ async def main() -> None:
     if not token:
         raise ValueError("DISCORD_TOKEN is not set in the environment / .env file")
 
-    async with bot:
-        await init_mods()
-        await load_cogs()
-        await bot.start(token)
+    try:
+        async with bot:
+            await init_mods()
+            await load_cogs()
+            await bot.start(token)
+    finally:
+        await shutdown_mods()
 
 
 if __name__ == "__main__":
@@ -123,5 +126,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-    finally:
-        asyncio.run(shutdown_mods())

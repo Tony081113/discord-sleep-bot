@@ -308,6 +308,10 @@ class DataStore:
         self.redis_available: bool = False
         self.d1_available: bool = False
 
+        # Set to True once the D1 cache/sync table has been created so we
+        # don't issue redundant DDL on every set() call.
+        self._cache_table_ready: bool = False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -322,8 +326,10 @@ class DataStore:
         await self._connect_redis()
         await self._connect_d1()
 
-        if self.redis_available and self.d1_available:
-            self._start_sync_task()
+        # Start the sync loop unconditionally.  The loop calls _ensure_redis /
+        # _ensure_d1 on every iteration and self-skips when either backend is
+        # unavailable, so it naturally picks up work once both come online.
+        self._start_sync_task()
 
         logger.info(
             "DataStore ready (redis=%s, d1=%s)",
@@ -477,6 +483,25 @@ class DataStore:
             logger.warning("D1 session closed — reconnecting …")
             await self._connect_d1()
 
+    async def _ensure_cache_table(self) -> None:
+        """Create the D1 cache/sync table the first time it is needed.
+
+        Uses a flag so the DDL is only sent once per ``DataStore`` lifetime,
+        avoiding unnecessary round-trips on every :meth:`set` call.
+        """
+        if self._cache_table_ready:
+            return
+        await self._d1_request(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_D1_SYNC_TABLE} (
+                key       TEXT PRIMARY KEY,
+                value     TEXT NOT NULL,
+                synced_at TEXT NOT NULL
+            )
+            """
+        )
+        self._cache_table_ready = True
+
     async def _d1_request(
         self, sql: str, params: Optional[list] = None
     ) -> list[dict[str, Any]]:
@@ -491,6 +516,13 @@ class DataStore:
         last_exc: Exception = RuntimeError("No attempts made")
 
         for attempt in range(1, self._d1_retries + 1):
+            # Re-open the session at the start of every attempt so that a
+            # previous failure (which closed/nulled the session) is recovered
+            # before the assert below, not after it.
+            await self._ensure_d1()
+            if not self.d1_available:
+                raise RuntimeError("D1 is not available")
+
             try:
                 assert self._d1_session is not None
                 async with self._d1_session.post(
@@ -516,10 +548,12 @@ class DataStore:
                 )
                 if attempt < self._d1_retries:
                     await asyncio.sleep(_RETRY_BACKOFF * attempt)
+                    # Close the stale session so _ensure_d1 opens a fresh one
+                    # on the next iteration.  Do NOT set d1_available = False
+                    # here — that would suppress reconnection.
                     if self._d1_session and not self._d1_session.closed:
                         await self._d1_session.close()
                     self._d1_session = None
-                    self.d1_available = False
 
         raise last_exc
 
@@ -558,45 +592,53 @@ class DataStore:
 
         assert self._redis is not None
 
-        # Ensure the target table exists
-        await self._d1_request(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_D1_SYNC_TABLE} (
-                key       TEXT PRIMARY KEY,
-                value     TEXT NOT NULL,
-                synced_at TEXT NOT NULL
-            )
-            """
-        )
+        # Ensure the target table exists (no-op after the first call).
+        await self._ensure_cache_table()
 
-        keys = await self._redis.keys(f"{_SYNC_KEY_PREFIX}*")
-        if not keys:
+        synced = 0
+        seen = 0
+        batch: list[str] = []
+        batch_size = 100
+
+        async def _process_batch(keys_batch: list[str]) -> int:
+            batch_synced = 0
+            for key in keys_batch:
+                try:
+                    value = await self._redis.get(key)  # type: ignore[union-attr]
+                    if value is None:
+                        continue
+                    await self._d1_request(
+                        f"""
+                        INSERT INTO {_D1_SYNC_TABLE} (key, value, synced_at)
+                        VALUES (?, ?, datetime('now'))
+                        ON CONFLICT(key) DO UPDATE SET
+                            value     = excluded.value,
+                            synced_at = excluded.synced_at
+                        """,
+                        [key, value],
+                    )
+                    batch_synced += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Failed to sync key '%s' to D1: %s", key, exc)
+            return batch_synced
+
+        async for key in self._redis.scan_iter(
+            match=f"{_SYNC_KEY_PREFIX}*", count=batch_size
+        ):
+            seen += 1
+            batch.append(key)
+            if len(batch) >= batch_size:
+                synced += await _process_batch(batch)
+                batch.clear()
+
+        if batch:
+            synced += await _process_batch(batch)
+
+        if seen == 0:
             logger.debug("Redis → D1 sync: no keys to sync")
             return
 
-        synced = 0
-        for key in keys:
-            try:
-                value = await self._redis.get(key)
-                if value is None:
-                    continue
-                await self._d1_request(
-                    f"""
-                    INSERT INTO {_D1_SYNC_TABLE} (key, value, synced_at)
-                    VALUES (?, ?, datetime('now'))
-                    ON CONFLICT(key) DO UPDATE SET
-                        value     = excluded.value,
-                        synced_at = excluded.synced_at
-                    """,
-                    [key, value],
-                )
-                synced += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Failed to sync key '%s' to D1: %s", key, exc)
-
-        logger.info(
-            "Redis → D1 sync complete: %d/%d keys synced", synced, len(keys)
-        )
+        logger.info("Redis → D1 sync complete: %d/%d keys synced", synced, seen)
 
     # ------------------------------------------------------------------
     # Public cache-aside API  (Redis hot cache + D1 persistence)
@@ -686,15 +728,7 @@ class DataStore:
         # Write to D1
         if persist and self.d1_available:
             try:
-                await self._d1_request(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {_D1_SYNC_TABLE} (
-                        key       TEXT PRIMARY KEY,
-                        value     TEXT NOT NULL,
-                        synced_at TEXT NOT NULL
-                    )
-                    """
-                )
+                await self._ensure_cache_table()
                 await self._d1_request(
                     f"""
                     INSERT INTO {_D1_SYNC_TABLE} (key, value, synced_at)
