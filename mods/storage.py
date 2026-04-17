@@ -298,6 +298,7 @@ class DataStore:
         self._redis_pool: Optional[ConnectionPool] = None
         self._redis: Optional[aioredis.Redis] = None
         self._d1_session: Optional[aiohttp.ClientSession] = None
+        self._d1_auth_failed: bool = False
         self._d1_base_url: str = (
             f"{_CF_API_BASE}/accounts/{self._cf_account_id}"
             f"/d1/database/{self._cf_database_id}/query"
@@ -442,6 +443,11 @@ class DataStore:
     # ------------------------------------------------------------------
 
     async def _connect_d1(self) -> None:
+        if self._d1_auth_failed:
+            # Auth failures are not transient; skip reconnect attempts until restart.
+            self.d1_available = False
+            return
+
         missing = [
             name
             for name, val in [
@@ -537,6 +543,15 @@ class DataStore:
                         return results[0].get("results", []) if results else []
                     else:
                         body = await resp.text()
+                        if resp.status == 401 or "Authentication error" in body:
+                            # Bad/expired API token is not transient; disable D1 to
+                            # avoid noisy retry loops from the sync task.
+                            self._d1_auth_failed = True
+                            self.d1_available = False
+                            if self._d1_session and not self._d1_session.closed:
+                                await self._d1_session.close()
+                            self._d1_session = None
+                            logger.error("D1 authentication failed; disabling D1 until restart")
                         raise RuntimeError(f"D1 HTTP {resp.status}: {body}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_exc = exc

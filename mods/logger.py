@@ -36,6 +36,7 @@ class _RedisLogHandler(logging.Handler):
         """
         super().__init__()
         self._redis = redis_client
+        self._exc_formatter = logging.Formatter()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -46,7 +47,8 @@ class _RedisLogHandler(logging.Handler):
                 "message": self.format(record),
             }
             if record.exc_info:
-                entry["exc_info"] = self.formatException(record.exc_info)
+                # logging.Handler has no formatException; delegate to Formatter.
+                entry["exc_info"] = self._exc_formatter.formatException(record.exc_info)
 
             payload = json.dumps(entry, ensure_ascii=False)
             pipe = self._redis.pipeline()

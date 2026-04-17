@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from mods.logger import attach_redis, setup_logger, get_configured_logger_names
+from mods.schema import init_schema
 from mods.storage import init_storage, close_storage
 
 logger = setup_logger(__name__)
@@ -33,8 +34,11 @@ logger = setup_logger(__name__)
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
+INTENTS.members = True
 
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
+SYNC_GUILD_ID = int(os.getenv("SYNC_GUILD_ID", "1493561394422087743"))
+_app_commands_synced = False
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +47,7 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 @bot.event
 async def on_ready() -> None:
+    await sync_app_commands_once()
     logger.info("Logged in as %s (id=%d)", bot.user, bot.user.id)
     logger.info("Guilds: %d", len(bot.guilds))
 
@@ -83,6 +88,9 @@ async def init_mods() -> None:
             store.d1_available,
         )
 
+        # Create / verify all D1 tables
+        await init_schema(store)
+
         # Attach a synchronous Redis handler to all configured loggers.
         # A synchronous client is required because logging.Handler.emit
         # cannot await coroutines.
@@ -101,6 +109,31 @@ async def shutdown_mods() -> None:
         await close_storage()
     except Exception as exc:  # noqa: BLE001
         logger.error("Error closing storage: %s", exc)
+
+
+async def sync_app_commands_once() -> None:
+    """Sync slash commands to one guild once per process start."""
+    global _app_commands_synced
+
+    if _app_commands_synced:
+        return
+
+    guild_obj = discord.Object(id=SYNC_GUILD_ID)
+    try:
+        synced = await bot.tree.sync(guild=guild_obj)
+        _app_commands_synced = True
+        logger.info(
+            "Synced %d app command(s) to guild id=%d",
+            len(synced),
+            SYNC_GUILD_ID,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to sync app commands to guild id=%d: %s",
+            SYNC_GUILD_ID,
+            exc,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
