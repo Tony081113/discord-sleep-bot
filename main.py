@@ -120,6 +120,8 @@ async def sync_app_commands_once() -> None:
 
     guild_obj = discord.Object(id=SYNC_GUILD_ID)
     try:
+        # Copy global commands (defined in cogs) into this guild scope first.
+        bot.tree.copy_global_to(guild=guild_obj)
         synced = await bot.tree.sync(guild=guild_obj)
         _app_commands_synced = True
         logger.info(

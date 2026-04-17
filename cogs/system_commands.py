@@ -47,8 +47,8 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
         store = get_storage()
 
         # Redis status
-        redis_conn = "connected" if store.redis_available else "disconnected"
-        redis_ping_text = "N/A"
+        redis_conn = "已連線" if store.redis_available else "未連線"
+        redis_ping_text = "不適用"
         if store.redis_available:
             try:
                 assert store._redis is not None
@@ -56,28 +56,28 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
                 await store._redis.ping()
                 redis_ping_text = f"{(perf_counter() - start) * 1000:.1f} ms"
             except Exception as exc:  # noqa: BLE001
-                redis_conn = f"error ({exc})"
+                redis_conn = f"錯誤（{exc}）"
 
         # D1 status
-        d1_conn = "connected" if store.d1_available else "disconnected"
-        d1_ping_text = "N/A"
+        d1_conn = "已連線" if store.d1_available else "未連線"
+        d1_ping_text = "不適用"
         if store.d1_available:
             try:
                 start = perf_counter()
                 await store.execute("SELECT 1 AS ok")
                 d1_ping_text = f"{(perf_counter() - start) * 1000:.1f} ms"
             except Exception as exc:  # noqa: BLE001
-                d1_conn = f"error ({exc})"
+                d1_conn = f"錯誤（{exc}）"
 
-        embed = discord.Embed(title="Storage Status", color=discord.Color.blurple())
+        embed = discord.Embed(title="儲存系統狀態", color=discord.Color.blurple())
         embed.add_field(
             name="Redis",
-            value=f"connection: {redis_conn}\nping: {redis_ping_text}",
+            value=f"連線狀態：{redis_conn}\n延遲：{redis_ping_text}",
             inline=False,
         )
         embed.add_field(
             name="Cloudflare D1",
-            value=f"connection: {d1_conn}\nping: {d1_ping_text}",
+            value=f"連線狀態：{d1_conn}\n延遲：{d1_ping_text}",
             inline=False,
         )
 
