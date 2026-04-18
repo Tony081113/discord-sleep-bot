@@ -27,9 +27,16 @@ import time
 from typing import Any
 
 import aiohttp
+import discord
 from aiohttp import web
 from discord.ext import commands
 
+from mods.defense import (
+    DEFAULT_DISABLE_SECONDS,
+    get_defense_state,
+    set_defense_disabled,
+    set_defense_enabled,
+)
 from mods.logger import setup_logger
 from mods.storage import get_storage
 
@@ -142,7 +149,13 @@ def _auth(fn):
 
 
 async def _check_approver(req: web.Request, guild_id: str) -> str | None:
-    """若當前登入者是 guild_id 的核准者，回傳其 user_id。"""
+    """若當前登入者是 guild_id 的核准者，回傳其 user_id。
+
+    若 bot 已不在該伺服器（已被踢/伺服器已刪），返回 'GONE' 謚號。
+    """
+    bot = req.app["bot"]
+    if not bot.get_guild(int(guild_id)):
+        return "GONE"
     uid = req["s"]["id"]
     store = get_storage()
     rows = await store.fetchall(
@@ -153,9 +166,29 @@ async def _check_approver(req: web.Request, guild_id: str) -> str | None:
     return uid if rows else None
 
 
+def _gone():
+    """Bot 已不在該伺服器時的統一錯誤回應。"""
+    return web.json_response({"error": "機器人已不在此伺服器（可能已被踢出或伺服器已刪除）"}, status=404)
+
+
 def _deny():
     """統一回傳核准者權限不足錯誤。"""
     return web.json_response({"error": "你不是這個伺服器的核准者"}, status=403)
+
+
+async def _require_approver(
+    req: web.Request, guild_id: str
+) -> tuple[str, None] | tuple[None, web.Response]:
+    """驗證 bot 在該 guild 且請求者為核准者。
+
+    回傳 (uid, None) 代表通過；回傳 (None, error_response) 代表拒絕。
+    """
+    result = await _check_approver(req, guild_id)
+    if result == "GONE":
+        return None, _gone()
+    if not result:
+        return None, _deny()
+    return result, None
 
 
 # ═════════════════════════════════════════════════════════
@@ -250,6 +283,7 @@ async def _auth_logout(req: web.Request) -> web.Response:
 async def _api_me(req: web.Request) -> web.Response:
     """回傳當前登入者與可管理伺服器清單。"""
     s = req["s"]
+    bot = req.app["bot"]
     store = get_storage()
     rows = await store.fetchall(
         "SELECT ra.guild_id, g.name "
@@ -258,7 +292,11 @@ async def _api_me(req: web.Request) -> web.Response:
         "WHERE ra.user_id = ?",
         [s["id"]],
     )
-    guilds = [{"id": r["guild_id"], "name": r["name"] or "未知伺服器"} for r in rows]
+    guilds = [
+        {"id": r["guild_id"], "name": r["name"] or "未知伺服器"}
+        for r in rows
+        if bot.get_guild(int(r["guild_id"]))
+    ]
     return web.json_response({
         "id": s["id"],
         "username": s["username"],
@@ -271,8 +309,9 @@ async def _api_me(req: web.Request) -> web.Response:
 async def _api_overview(req: web.Request) -> web.Response:
     """回傳單一伺服器總覽數據（事件、待復原、成員等）。"""
     gid = req.match_info["gid"]
-    if not await _check_approver(req, gid):
-        return _deny()
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     bot = req.app["bot"]
@@ -321,8 +360,9 @@ async def _api_overview(req: web.Request) -> web.Response:
 async def _api_events(req: web.Request) -> web.Response:
     """回傳近期事件列表（temp_cache）。"""
     gid = req.match_info["gid"]
-    if not await _check_approver(req, gid):
-        return _deny()
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     rows = await store.fetchall(
@@ -337,8 +377,9 @@ async def _api_events(req: web.Request) -> web.Response:
 async def _api_recovery_requests(req: web.Request) -> web.Response:
     """回傳近期復原請求列表。"""
     gid = req.match_info["gid"]
-    if not await _check_approver(req, gid):
-        return _deny()
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     rows = await store.fetchall(
@@ -354,39 +395,73 @@ async def _api_approve(req: web.Request) -> web.Response:
     """核准指定復原請求並執行復原。"""
     gid = req.match_info["gid"]
     rid = req.match_info["rid"]
-    uid = await _check_approver(req, gid)
-    if not uid:
-        return _deny()
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     bot: commands.Bot = req.app["bot"]
     guild = bot.get_guild(int(gid))
-    if not guild:
-        return web.json_response({"error": "找不到伺服器，機器人可能已離開"}, status=404)
 
     rr = await store.fetchall(
-        "SELECT id FROM recovery_requests "
-        "WHERE id = ? AND guild_id = ? AND status = 'pending'",
+        "SELECT status, approved_by FROM recovery_requests "
+        "WHERE id = ? AND guild_id = ?",
         [rid, gid],
     )
     if not rr:
-        return web.json_response({"error": "找不到待處理的復原請求"}, status=404)
+        return web.json_response({"error": "找不到這筆復原請求"}, status=404)
+
+    status = rr[0]["status"]
+    if status != "pending":
+        return web.json_response(
+            {"error": f"此請求目前為 {status}，不可重複同意"},
+            status=409,
+        )
+
+    await store.execute(
+        "UPDATE recovery_requests "
+        "SET status='processing', approved_by=? "
+        "WHERE id=? AND guild_id=? AND status='pending'",
+        [uid, rid, gid],
+    )
+
+    recheck = await store.fetchall(
+        "SELECT status, approved_by FROM recovery_requests "
+        "WHERE id = ? AND guild_id = ?",
+        [rid, gid],
+    )
+    if (
+        not recheck
+        or recheck[0]["status"] != "processing"
+        or str(recheck[0].get("approved_by") or "") != str(uid)
+    ):
+        return web.json_response(
+            {"error": "這筆復原請求已由其他核准者處理"},
+            status=409,
+        )
 
     cog = bot.get_cog("Recovery")
     if not cog:
         return web.json_response({"error": "復原模組未載入"}, status=500)
 
     try:
-        ch, ro, ms = await cog._execute_recovery(store, guild)
+        ch, ro, ms = await cog.run_recovery_with_lock(store, guild, rid)
         await store.execute(
             "UPDATE recovery_requests "
             "SET status='approved', approved_by=?, "
             "result_channels=?, result_roles=?, result_messages=?, "
-            "resolved_at=strftime('%s','now') WHERE id=?",
-            [uid, ch, ro, ms, rid],
+            "resolved_at=strftime('%s','now') "
+            "WHERE id=? AND guild_id=? AND status='processing' AND approved_by=?",
+            [uid, ch, ro, ms, rid, gid, uid],
         )
         return web.json_response({"message": "復原完成", "channels": ch, "roles": ro, "messages": ms})
     except Exception as exc:
+        await store.execute(
+            "UPDATE recovery_requests "
+            "SET status='failed', approved_by=?, resolved_at=strftime('%s','now') "
+            "WHERE id=? AND guild_id=?",
+            [uid, rid, gid],
+        )
         logger.error("Web approve recovery failed: %s", exc, exc_info=True)
         return web.json_response({"error": "復原執行失敗，請稍後重試或聯繫系統管理員。"}, status=500)
 
@@ -396,17 +471,63 @@ async def _api_reject(req: web.Request) -> web.Response:
     """拒絕指定復原請求。"""
     gid = req.match_info["gid"]
     rid = req.match_info["rid"]
-    uid = await _check_approver(req, gid)
-    if not uid:
-        return _deny()
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
+    before = await store.fetchall(
+        "SELECT status FROM recovery_requests WHERE id=? AND guild_id=?",
+        [rid, gid],
+    )
+    if not before:
+        return web.json_response({"error": "找不到這筆復原請求"}, status=404)
+
+    if before[0]["status"] != "pending":
+        return web.json_response(
+            {"error": f"此請求目前為 {before[0]['status']}，不可重複拒絕"},
+            status=409,
+        )
+
     await store.execute(
         "UPDATE recovery_requests "
         "SET status='rejected', approved_by=?, resolved_at=strftime('%s','now') "
         "WHERE id=? AND guild_id=? AND status='pending'",
         [uid, rid, gid],
     )
+
+    recheck = await store.fetchall(
+        "SELECT status, approved_by FROM recovery_requests WHERE id=? AND guild_id=?",
+        [rid, gid],
+    )
+    if (
+        not recheck
+        or recheck[0]["status"] != "rejected"
+        or str(recheck[0].get("approved_by") or "") != str(uid)
+    ):
+        return web.json_response(
+            {"error": "這筆復原請求已由其他核准者處理"},
+            status=409,
+        )
+
+    bot: commands.Bot = req.app["bot"]
+    cog = bot.get_cog("Recovery")
+    if cog:
+        rejected_embed = discord.Embed(
+            title="❌ 已拒絕還原",
+            description=(
+                f"**{req['s']['username']}** 於 Web 面板拒絕此復原請求，不會執行還原。"
+            ),
+            color=discord.Color.light_grey(),
+        )
+        await cog._edit_alert_dms(
+            store,
+            gid,
+            rid,
+            rejected_embed,
+            view=discord.ui.View(),
+        )
+
     return web.json_response({"message": "已拒絕復原請求"})
 
 
@@ -414,14 +535,12 @@ async def _api_reject(req: web.Request) -> web.Response:
 async def _api_manual(req: web.Request) -> web.Response:
     """手動觸發一次復原流程。"""
     gid = req.match_info["gid"]
-    uid = await _check_approver(req, gid)
-    if not uid:
-        return _deny()
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     bot: commands.Bot = req.app["bot"]
     guild = bot.get_guild(int(gid))
-    if not guild:
-        return web.json_response({"error": "找不到伺服器，機器人可能已離開"}, status=404)
 
     cog = bot.get_cog("Recovery")
     if not cog:
@@ -436,7 +555,7 @@ async def _api_manual(req: web.Request) -> web.Response:
     )
 
     try:
-        ch, ro, ms = await cog._execute_recovery(store, guild)
+        ch, ro, ms = await cog.run_recovery_with_lock(store, guild)
         # 更新剛建立的 manual 請求結果。
         latest = await store.fetchall(
             "SELECT id FROM recovery_requests "
@@ -460,8 +579,9 @@ async def _api_manual(req: web.Request) -> web.Response:
 async def _api_thresholds_get(req: web.Request) -> web.Response:
     """讀取伺服器異常門檻（含預設值）。"""
     gid = req.match_info["gid"]
-    if not await _check_approver(req, gid):
-        return _deny()
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     rows = await store.fetchall(
@@ -485,9 +605,9 @@ async def _api_thresholds_get(req: web.Request) -> web.Response:
 async def _api_thresholds_set(req: web.Request) -> web.Response:
     """更新伺服器異常門檻設定。"""
     gid = req.match_info["gid"]
-    uid = await _check_approver(req, gid)
-    if not uid:
-        return _deny()
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     try:
         body = await req.json()
@@ -520,11 +640,72 @@ async def _api_thresholds_set(req: web.Request) -> web.Response:
 
 
 @_auth
+async def _api_defense_status(req: web.Request) -> web.Response:
+    """讀取伺服器防禦系統啟停狀態。"""
+    gid = req.match_info["gid"]
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
+
+    store = get_storage()
+    defense = await get_defense_state(store, gid)
+    return web.json_response({"defense": defense})
+
+
+@_auth
+async def _api_defense_disable(req: web.Request) -> web.Response:
+    """暫停防禦系統，預設 1 小時後自動恢復。"""
+    gid = req.match_info["gid"]
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
+
+    duration = DEFAULT_DISABLE_SECONDS
+    try:
+        body = await req.json()
+        if isinstance(body, dict):
+            raw_duration = body.get("duration_seconds")
+            if isinstance(raw_duration, int):
+                duration = raw_duration
+    except Exception:
+        # Allow empty body and keep default duration.
+        pass
+
+    store = get_storage()
+    defense = await set_defense_disabled(store, gid, uid, duration_seconds=duration)
+    return web.json_response(
+        {
+            "message": "防禦系統已暫時關閉",
+            "defense": defense,
+        }
+    )
+
+
+@_auth
+async def _api_defense_enable(req: web.Request) -> web.Response:
+    """立即重新啟用防禦系統。"""
+    gid = req.match_info["gid"]
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
+
+    store = get_storage()
+    defense = await set_defense_enabled(store, gid, uid)
+    return web.json_response(
+        {
+            "message": "防禦系統已重新啟用",
+            "defense": defense,
+        }
+    )
+
+
+@_auth
 async def _api_logs_get(req: web.Request) -> web.Response:
     """讀取維運日誌。"""
     gid = req.match_info["gid"]
-    if not await _check_approver(req, gid):
-        return _deny()
+    _, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     store = get_storage()
     rows = await store.fetchall(
@@ -540,9 +721,9 @@ async def _api_logs_get(req: web.Request) -> web.Response:
 async def _api_logs_post(req: web.Request) -> web.Response:
     """新增一筆維運日誌。"""
     gid = req.match_info["gid"]
-    uid = await _check_approver(req, gid)
-    if not uid:
-        return _deny()
+    uid, err = await _require_approver(req, gid)
+    if err:
+        return err
 
     try:
         body = await req.json()
@@ -611,6 +792,9 @@ class WebCog(commands.Cog, name="Web"):
         r.add_post("/api/guilds/{gid}/recovery/manual", _api_manual)
         r.add_get("/api/guilds/{gid}/thresholds", _api_thresholds_get)
         r.add_put("/api/guilds/{gid}/thresholds", _api_thresholds_set)
+        r.add_get("/api/guilds/{gid}/defense-status", _api_defense_status)
+        r.add_post("/api/guilds/{gid}/defense/disable", _api_defense_disable)
+        r.add_post("/api/guilds/{gid}/defense/enable", _api_defense_enable)
         r.add_get("/api/guilds/{gid}/maintenance-logs", _api_logs_get)
         r.add_post("/api/guilds/{gid}/maintenance-logs", _api_logs_post)
 

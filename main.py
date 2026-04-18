@@ -37,9 +37,49 @@ INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
 
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
-SYNC_GUILD_ID = int(os.getenv("SYNC_GUILD_ID", "1493561394422087743"))
+bot = commands.Bot(command_prefix=">>", intents=INTENTS)
 _app_commands_synced = False
+
+
+# ---------------------------------------------------------------------------
+# Owner-only prefix commands
+# ---------------------------------------------------------------------------
+
+@bot.command(name="reload")
+async def cmd_reload(ctx: commands.Context, cog: str = "") -> None:
+    """Reload one cog (``>>reload cogs.monitoring``) or all cogs (``>>reload``)."""
+    admin_id = os.getenv("BOT_ADMIN_ID", "").strip()
+    if not admin_id or str(ctx.author.id) != admin_id:
+        return
+    cogs_dir = pathlib.Path(__file__).parent / "cogs"
+    targets: list[str] = []
+    if cog:
+        targets = [cog if "." in cog else f"cogs.{cog}"]
+    else:
+        targets = [
+            f"cogs.{f.stem}"
+            for f in sorted(cogs_dir.glob("*.py"))
+            if not f.name.startswith("_")
+        ]
+
+    ok, fail = [], []
+    for module in targets:
+        try:
+            if module in bot.extensions:
+                await bot.reload_extension(module)
+            else:
+                await bot.load_extension(module)
+            ok.append(module)
+        except Exception as exc:  # noqa: BLE001
+            fail.append(f"{module}: {exc}")
+            logger.error("Reload failed for '%s': %s", module, exc, exc_info=True)
+
+    lines = []
+    if ok:
+        lines.append("\u2705 " + ", ".join(ok))
+    if fail:
+        lines += [f"\u274c {f}" for f in fail]
+    await ctx.send("\n".join(lines) or "nothing to reload")
 
 
 # ---------------------------------------------------------------------------
@@ -113,30 +153,59 @@ async def shutdown_mods() -> None:
 
 
 async def sync_app_commands_once() -> None:
-    """Sync slash commands to one guild once per process start."""
+    """Sync slash commands once per process start.
+
+    Tries guild-scoped sync for every guild the bot is in (fastest propagation).
+    Falls back to global sync if all guild syncs fail (e.g. missing
+    ``applications.commands`` scope — bot was invited without it).
+    """
     global _app_commands_synced
 
     if _app_commands_synced:
         return
 
-    guild_obj = discord.Object(id=SYNC_GUILD_ID)
-    try:
-        # Copy global commands (defined in cogs) into this guild scope first.
-        bot.tree.copy_global_to(guild=guild_obj)
-        synced = await bot.tree.sync(guild=guild_obj)
-        _app_commands_synced = True
-        logger.info(
-            "Synced %d app command(s) to guild id=%d",
-            len(synced),
-            SYNC_GUILD_ID,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "Failed to sync app commands to guild id=%d: %s",
-            SYNC_GUILD_ID,
-            exc,
-            exc_info=True,
-        )
+    guild_synced = 0
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            logger.info(
+                "Synced %d app command(s) to guild '%s' (id=%d)",
+                len(synced),
+                guild.name,
+                guild.id,
+            )
+            guild_synced += 1
+        except discord.Forbidden:
+            logger.warning(
+                "Cannot sync commands to guild '%s' (id=%d) — "
+                "bot may be missing applications.commands scope",
+                guild.name,
+                guild.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to sync app commands to guild '%s' (id=%d): %s",
+                guild.name,
+                guild.id,
+                exc,
+                exc_info=True,
+            )
+
+    if guild_synced == 0:
+        # No guild accepted the sync; fall back to global (propagates in ~1 hour).
+        try:
+            synced = await bot.tree.sync()
+            logger.warning(
+                "Guild sync failed for all guilds — fell back to global sync "
+                "(%d commands, may take up to 1 hour to propagate)",
+                len(synced),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Global app command sync also failed: %s", exc, exc_info=True)
+            return
+
+    _app_commands_synced = True
 
 
 # ---------------------------------------------------------------------------

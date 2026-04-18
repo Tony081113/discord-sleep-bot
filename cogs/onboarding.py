@@ -67,6 +67,24 @@ def _role_to_dict(role: discord.Role) -> dict:
     }
 
 
+def _guild_to_dict(guild: discord.Guild) -> dict:
+    """將伺服器名稱/縮圖/橫幅轉為快照資料。"""
+    return {
+        "guild_id": str(guild.id),
+        "name": guild.name,
+        "icon_url": str(guild.icon.url) if guild.icon else None,
+        "banner_url": str(guild.banner.url) if guild.banner else None,
+    }
+
+
+def _member_to_dict(member: discord.Member) -> dict:
+    """將成員暱稱快照化，供還原時復原 nick。"""
+    return {
+        "user_id": str(member.id),
+        "nick": member.nick,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -332,6 +350,11 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
             """,
             [guild_id, guild.name, str(guild.owner_id)],
         )
+        await store.execute(
+            "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) "
+            "VALUES (?, ?, ?, ?)",
+            [guild_id, "guild", guild_id, json.dumps(_guild_to_dict(guild), ensure_ascii=False)],
+        )
 
         # 2. Store channels + snapshots
         for channel in guild.channels:
@@ -378,6 +401,14 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
                 [guild_id, "role", str(role.id), json.dumps(r_data, ensure_ascii=False)],
             )
 
+        # 3.5 Store member nick snapshots
+        for member in guild.members:
+            m_data = _member_to_dict(member)
+            await store.execute(
+                "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+                [guild_id, "member", str(member.id), json.dumps(m_data, ensure_ascii=False)],
+            )
+
         logger.info(
             "Initial snapshot stored for '%s': %d channels, %d roles",
             guild.name, len(guild.channels), len(guild.roles),
@@ -394,7 +425,35 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
             await self._send_approval_dm(admin, guild)
             await asyncio.sleep(DM_SEND_DELAY)
 
-
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """機器人離開或被踢出伺服器時，清除所有相關資料。"""
+        guild_id = str(guild.id)
+        logger.info("Removed from guild '%s' (id=%s) — purging data", guild.name, guild_id)
+        store = get_storage()
+        try:
+            # guilds 表的 ON DELETE CASCADE 會自動清除所有外鍵關聯資料。
+            await store.execute(
+                "DELETE FROM guilds WHERE guild_id = ?",
+                [guild_id],
+            )
+            # temp_cache 與 maintenance_logs 無外鍵約束，須手動刪除。
+            await store.execute(
+                "DELETE FROM temp_cache WHERE guild_id = ?",
+                [guild_id],
+            )
+            await store.execute(
+                "DELETE FROM maintenance_logs WHERE guild_id = ?",
+                [guild_id],
+            )
+            logger.info("Purged all data for guild=%s", guild_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to purge data for guild=%s: %s",
+                guild_id,
+                exc,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------- helpers
 
@@ -410,13 +469,6 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
             style=discord.ButtonStyle.success,
             custom_id=f"accept_approver:{guild_id}",
         )
-
-        async def _accept_callback(interaction: discord.Interaction) -> None:
-            await self._handle_accept_approver(
-                interaction, f"accept_approver:{guild_id}"
-            )
-
-        btn.callback = _accept_callback
         view.add_item(btn)
 
         embed = discord.Embed(
@@ -478,13 +530,6 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
             style=discord.ButtonStyle.primary,
             custom_id=f"retry_dm:{guild.id}:{member.id}",
         )
-
-        async def _retry_callback(interaction: discord.Interaction) -> None:
-            await self._handle_retry_dm(
-                interaction, f"retry_dm:{guild.id}:{member.id}"
-            )
-
-        retry_btn.callback = _retry_callback
         view.add_item(retry_btn)
 
         view.add_item(
@@ -507,6 +552,12 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
         self, interaction: discord.Interaction, custom_id: str
     ) -> None:
         """處理邀請按鈕：將使用者寫入 recovery_approvers。"""
+        async def _send_ephemeral(content: str) -> None:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, ephemeral=True)
+            else:
+                await interaction.response.send_message(content, ephemeral=True)
+
         parts = custom_id.split(":")
         if len(parts) < 2:
             return
@@ -514,6 +565,21 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
         user_id = str(interaction.user.id)
 
         store = get_storage()
+        existing = await store.fetchone(
+            "SELECT 1 FROM recovery_approvers WHERE guild_id = ? AND user_id = ?",
+            [guild_id, user_id],
+        )
+
+        # 申請已收到（或已通過）時：收回按鈕；若仍被點擊則回覆已通過。
+        if existing:
+            try:
+                if interaction.message is not None:
+                    await interaction.message.edit(view=discord.ui.View())
+            except Exception:
+                pass
+            await _send_ephemeral("✅ 已收到並通過申請。")
+            return
+
         await store.execute(
             """
             INSERT INTO recovery_approvers (guild_id, user_id)
@@ -523,9 +589,14 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
             [guild_id, user_id],
         )
 
-        await interaction.response.send_message(
+        try:
+            if interaction.message is not None:
+                await interaction.message.edit(view=discord.ui.View())
+        except Exception:
+            pass
+
+        await _send_ephemeral(
             "\u2705 你已成功接受擔任復原核准者！當偵測到異常時，你將收到警報通知。",
-            ephemeral=True,
         )
         logger.info(
             "User %s accepted approver role for guild %s", user_id, guild_id

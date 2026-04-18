@@ -8,8 +8,10 @@
 
 import asyncio
 import json
+import os
 from typing import Any
 
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -26,22 +28,87 @@ _MAX_RESTORE_MESSAGES = 100
 _WEBHOOK_SEND_DELAY = 0.6  # seconds between webhook sends (rate-limit safety)
 
 
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    """Read int from env with clamped safety bounds."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid env %s=%r, fallback=%s", name, raw, default)
+        return default
+    return max(min_value, min(max_value, value))
+
+
+_ROLE_MEMBER_RESTORE_CONCURRENCY = _env_int(
+    "RECOVERY_ROLE_MEMBER_CONCURRENCY", default=3, min_value=1, max_value=8
+)
+_MESSAGE_RESTORE_CHANNEL_CONCURRENCY = _env_int(
+    "RECOVERY_MESSAGE_CHANNEL_CONCURRENCY", default=2, min_value=1, max_value=5
+)
+_CHANNEL_RESTORE_CONCURRENCY = _env_int(
+    "RECOVERY_CHANNEL_RESTORE_CONCURRENCY", default=2, min_value=1, max_value=4
+)
+_ROLE_RESTORE_CONCURRENCY = _env_int(
+    "RECOVERY_ROLE_RESTORE_CONCURRENCY", default=2, min_value=1, max_value=4
+)
+_CHANNEL_DELETE_CONCURRENCY = _env_int(
+    "RECOVERY_CHANNEL_DELETE_CONCURRENCY", default=2, min_value=1, max_value=4
+)
+_ROLE_DELETE_CONCURRENCY = _env_int(
+    "RECOVERY_ROLE_DELETE_CONCURRENCY", default=2, min_value=1, max_value=4
+)
+
+
 class RecoveryCog(commands.Cog, name="Recovery"):
     """負責伺服器結構與訊息的復原。"""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # 每個 guild 只允許單一還原流程同時執行，避免併發造成 429。
+        self._guild_recovery_locks: dict[str, asyncio.Lock] = {}
+
+    async def run_recovery_with_lock(
+        self,
+        store,
+        guild: discord.Guild,
+        request_id: str | None = None,
+    ) -> tuple[int, int, int]:
+        """在 guild 級別鎖下執行還原，避免同伺服器重複復原互相踩踏。"""
+        guild_id = str(guild.id)
+        lock = self._guild_recovery_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._guild_recovery_locks[guild_id] = lock
+
+        async with lock:
+            return await self._execute_recovery(store, guild, request_id)
+
+    async def _gather_bounded(self, coros: list, limit: int) -> list[Any]:
+        """執行有界併發：加速還原，同時避免瞬間打滿 API。"""
+        if not coros:
+            return []
+        sem = asyncio.Semaphore(max(1, limit))
+
+        async def _runner(coro):
+            async with sem:
+                return await coro
+
+        return await asyncio.gather(*(_runner(c) for c in coros), return_exceptions=False)
 
     # -------------------------------------------------------- interaction
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction) -> None:
-        """接收按鈕互動，攔截 execute_recovery 事件。"""
+        """接收按鈕互動，攔截 execute_recovery 與 decline_recovery 事件。"""
         if interaction.type != discord.InteractionType.component:
             return
         custom_id = interaction.data.get("custom_id", "")
         if custom_id.startswith("execute_recovery:"):
             await self._handle_recovery(interaction, custom_id)
+        elif custom_id.startswith("decline_recovery:"):
+            await self._handle_decline(interaction, custom_id)
 
     # -------------------------------------------------------- main handler
 
@@ -49,6 +116,13 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         self, interaction: discord.Interaction, custom_id: str
     ) -> None:
         """驗證核准者身份後，執行完整復原流程。"""
+
+        async def _send_ephemeral(content: str) -> None:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, ephemeral=True)
+            else:
+                await interaction.response.send_message(content, ephemeral=True)
+
         parts = custom_id.split(":")
         if len(parts) < 2:
             logger.warning("Invalid recovery custom_id=%s", custom_id)
@@ -70,9 +144,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 request_id,
                 interaction.user.id,
             )
-            await interaction.response.send_message(
-                "\u274c 找不到伺服器。", ephemeral=True
-            )
+            await _send_ephemeral("\u274c 找不到伺服器。")
             return
 
         # 檢查是否為核准者
@@ -89,12 +161,78 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 interaction.user.id,
                 len(approvers),
             )
-            await interaction.response.send_message(
-                "\u274c 你不是已註冊的核准者。", ephemeral=True
-            )
+            await _send_ephemeral("\u274c 你不是已註冊的核准者。")
             return
 
-        await interaction.response.defer(ephemeral=True)
+        # 有 request_id 時，先鎖定請求狀態，避免重複執行同一筆復原。
+        if request_id:
+            request_rows = await store.fetchall(
+                "SELECT status FROM recovery_requests WHERE id = ? AND guild_id = ?",
+                [request_id, guild_id],
+            )
+            if not request_rows:
+                await _send_ephemeral("\u274c 找不到這筆復原請求。")
+                return
+
+            current_status = request_rows[0]["status"]
+            if current_status != "pending":
+                if current_status in {"rejected", "declined"}:
+                    rejected_embed = discord.Embed(
+                        title="❌ 已拒絕還原",
+                        description="此復原請求已被拒絕，不會執行還原。",
+                        color=discord.Color.light_grey(),
+                    )
+                    await self._edit_alert_dms(
+                        store,
+                        guild_id,
+                        request_id,
+                        rejected_embed,
+                        view=discord.ui.View(),
+                    )
+                    try:
+                        if not interaction.response.is_done():
+                            await interaction.response.edit_message(
+                                embed=rejected_embed,
+                                view=discord.ui.View(),
+                            )
+                        elif interaction.message:
+                            await interaction.message.edit(
+                                embed=rejected_embed,
+                                view=discord.ui.View(),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to refresh rejected recovery message guild=%s request_id=%s: %s",
+                            guild_id,
+                            request_id,
+                            exc,
+                        )
+                await _send_ephemeral(
+                    f"ℹ️ 這筆復原請求目前狀態為「{current_status}」，不可重複執行。"
+                )
+                return
+
+            await store.execute(
+                "UPDATE recovery_requests "
+                "SET status='processing', approved_by=? "
+                "WHERE id=? AND guild_id=? AND status='pending'",
+                [str(interaction.user.id), request_id, guild_id],
+            )
+
+            recheck = await store.fetchall(
+                "SELECT status, approved_by FROM recovery_requests WHERE id = ? AND guild_id = ?",
+                [request_id, guild_id],
+            )
+            if (
+                not recheck
+                or recheck[0]["status"] != "processing"
+                or str(recheck[0].get("approved_by") or "") != str(interaction.user.id)
+            ):
+                await _send_ephemeral("ℹ️ 這筆復原請求已由其他人處理或狀態已變更。")
+                return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         logger.info(
             "Recovery approved for execution guild=%s request_id=%s user=%s",
             guild_id,
@@ -102,8 +240,21 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             interaction.user.id,
         )
 
+        # 告知所有核准者：正在處理中。
+        if request_id:
+            processing_embed = discord.Embed(
+                title="\U0001f504 還原處理中…",
+                description=(
+                    f"**{interaction.user.display_name}** 已同意，正在執行伺服器還原，請稍候。"
+                ),
+                color=discord.Color.yellow(),
+            )
+            await self._edit_alert_dms(
+                store, guild_id, request_id, processing_embed, view=discord.ui.View()
+            )
+
         try:
-            ch, ro, ms = await self._execute_recovery(store, guild, request_id)
+            ch, ro, ms = await self.run_recovery_with_lock(store, guild, request_id)
 
             # 若有對應請求，更新請求狀態
             if request_id:
@@ -113,8 +264,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         "SET status='approved', approved_by=?, "
                         "result_channels=?, result_roles=?, result_messages=?, "
                         "resolved_at=strftime('%s','now') "
-                        "WHERE id=? AND status='pending'",
-                        [str(interaction.user.id), ch, ro, ms, request_id],
+                        "WHERE id=? AND guild_id=?",
+                        [str(interaction.user.id), ch, ro, ms, request_id, guild_id],
                     )
                     logger.info(
                         "Recovery request marked approved request_id=%s guild=%s user=%s channels=%s roles=%s messages=%s",
@@ -134,13 +285,24 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         exc_info=True,
                     )
 
-            await interaction.followup.send(
+            await _send_ephemeral(
                 f"\u2705 復原完成！\n"
                 f"\U0001f4c1 頻道復原：{ch}\n"
                 f"\U0001f3f7\ufe0f 身分組復原：{ro}\n"
                 f"\U0001f4ac 訊息還原：{ms}",
-                ephemeral=True,
             )
+            # 通知所有核准者：已還原。
+            if request_id:
+                done_embed = discord.Embed(
+                    title="\u2705 伺服器已還原",
+                    description=(
+                        f"\U0001f4c1 頻道：**{ch}**　\U0001f3f7\ufe0f 身分組：**{ro}**　\U0001f4ac 訊息：**{ms}**"
+                    ),
+                    color=discord.Color.green(),
+                )
+                await self._edit_alert_dms(
+                    store, guild_id, request_id, done_embed, view=discord.ui.View()
+                )
         except Exception as exc:
             logger.error(
                 "Recovery failed guild=%s request_id=%s user=%s: %s",
@@ -155,8 +317,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     await store.execute(
                         "UPDATE recovery_requests "
                         "SET status='failed', approved_by=?, resolved_at=strftime('%s','now') "
-                        "WHERE id=? AND status='pending'",
-                        [str(interaction.user.id), request_id],
+                        "WHERE id=? AND guild_id=?",
+                        [str(interaction.user.id), request_id, guild_id],
                     )
                     logger.info(
                         "Recovery request marked failed request_id=%s guild=%s user=%s",
@@ -172,48 +334,120 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         update_exc,
                         exc_info=True,
                     )
-            await interaction.followup.send(
-                "\u274c 復原失敗，請稍後重試或聯繫系統管理員。", ephemeral=True
+            await _send_ephemeral("\u274c 復原失敗，請稍後重試或聯繫系統管理員。")
+
+    # -------------------------------------------------------- 不同意處理
+
+    async def _handle_decline(
+        self, interaction: discord.Interaction, custom_id: str
+    ) -> None:
+        """核准者點擊「不同意」按鈕：標記請求為 declined，不執行任何還原。"""
+        parts = custom_id.split(":")
+        if len(parts) < 2:
+            return
+        guild_id = parts[1]
+        request_id = parts[2] if len(parts) > 2 else None
+
+        store = get_storage()
+        approvers = await store.fetchall(
+            "SELECT user_id FROM recovery_approvers WHERE guild_id = ?", [guild_id]
+        )
+        if str(interaction.user.id) not in {r["user_id"] for r in approvers}:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "\u274c 你不是已註冊的核准者。", ephemeral=True
+                )
+            return
+
+        if request_id:
+            await store.execute(
+                "UPDATE recovery_requests "
+                "SET status='declined', approved_by=?, resolved_at=strftime('%s','now') "
+                "WHERE id=? AND guild_id=? AND status='pending'",
+                [str(interaction.user.id), request_id, guild_id],
+            )
+            logger.info(
+                "Recovery declined guild=%s request_id=%s user=%s",
+                guild_id, request_id, interaction.user.id,
             )
 
+        declined_embed = discord.Embed(
+            title="\u274c 已拒絕還原",
+            description=f"**{interaction.user.display_name}** 選擇不執行還原。",
+            color=discord.Color.light_grey(),
+        )
+        # 編輯所有核准者的告警訊息。
+        if request_id:
+            await self._edit_alert_dms(
+                store, guild_id, request_id, declined_embed, view=discord.ui.View()
+            )
+        # 也直接編輯觸發互動的訊息（可能與上面重複，但確保當前訊息一定被更新）。
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(
+                    embed=declined_embed, view=discord.ui.View()
+                )
+            else:
+                await interaction.message.edit(embed=declined_embed, view=discord.ui.View())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to edit decline interaction msg: %s", exc)
+
+    # -------------------------------------------------------- DM 編輯工具
+
+    async def _edit_alert_dms(
+        self,
+        store,
+        guild_id: str,
+        request_id: str,
+        embed: discord.Embed,
+        view: discord.ui.View | None = None,
+    ) -> None:
+        """依 recovery_requests.alert_msg_ids 批次編輯所有核准者的告警私訊。"""
+        try:
+            rows = await store.fetchall(
+                "SELECT alert_msg_ids FROM recovery_requests WHERE id = ? AND guild_id = ?",
+                [request_id, guild_id],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to fetch alert_msg_ids request_id=%s: %s", request_id, exc)
+            return
+
+        if not rows or not rows[0]["alert_msg_ids"]:
+            return
+
+        try:
+            msg_id_map: dict[str, int] = json.loads(rows[0]["alert_msg_ids"])
+        except Exception:
+            return
+
+        empty_view = discord.ui.View() if view is None else view
+        for user_id_str, msg_id in msg_id_map.items():
+            user = self.bot.get_user(int(user_id_str))
+            if not user:
+                try:
+                    user = await self.bot.fetch_user(int(user_id_str))
+                except Exception:
+                    continue
+            try:
+                dm = await user.create_dm()
+                msg = await dm.fetch_message(int(msg_id))
+                await msg.edit(embed=embed, view=empty_view)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to edit alert DM user=%s request_id=%s: %s",
+                    user_id_str, request_id, exc,
+                )
+
     # -------------------------------------------------------- 復原主流程
-
-    async def _execute_recovery(
-        self, store, guild: discord.Guild, request_id: str | None = None
-    ) -> tuple[int, int, int]:
-        """執行三段式復原：頻道、身分組、訊息。"""
-        guild_id = str(guild.id)
-
-        channel_snaps = await self._get_pre_attack_snapshots(
-            store, guild_id, "channel"
-        )
-        role_snaps = await self._get_pre_attack_snapshots(
-            store, guild_id, "role"
-        )
-
-        logger.info(
-            "Recovery snapshots loaded guild=%s request_id=%s channel_snapshots=%s role_snapshots=%s",
-            guild_id,
-            request_id,
-            len(channel_snaps),
-            len(role_snaps),
-        )
-
-        restored_ch = await self._restore_channels(guild, channel_snaps)
-        restored_ro = await self._restore_roles(guild, role_snaps)
-        restored_ms = await self._restore_messages(store, guild)
-
-        logger.info(
-            "Recovery finished guild=%s request_id=%s channels=%d roles=%d messages=%d",
-            guild_id, request_id, restored_ch, restored_ro, restored_ms,
-        )
-        return restored_ch, restored_ro, restored_ms
 
     async def _get_pre_attack_snapshots(
         self, store, guild_id: str, target_type: str
     ) -> list[dict[str, Any]]:
-        """取得每個目標在攻擊前（至少 _RECOVERY_LOOKBACK 秒前）的最新快照。"""
-        return await store.fetchall(
+        """取得每個目標在攻擊前（至少 _RECOVERY_LOOKBACK 秒前）的最新快照。
+
+        若不存在 5 分鐘前的資料，退回使用最早的快照（防止伺服器剛建立就遭攻擊）。
+        """
+        rows = await store.fetchall(
             """
             SELECT s1.target_id, s1.snapshot_data, s1.timestamp
             FROM structure_snapshots s1
@@ -228,25 +462,166 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             """,
             [guild_id, target_type, _RECOVERY_LOOKBACK, guild_id, target_type],
         )
+        if rows:
+            return rows
+        # 無 5 分鐘前快照時，退回各目標最早的一筆。
+        logger.warning(
+            "No pre-attack snapshots found guild=%s type=%s — falling back to earliest",
+            guild_id, target_type,
+        )
+        return await store.fetchall(
+            """
+            SELECT s1.target_id, s1.snapshot_data, s1.timestamp
+            FROM structure_snapshots s1
+            INNER JOIN (
+                SELECT target_id, MIN(timestamp) AS min_ts
+                FROM structure_snapshots
+                WHERE guild_id = ? AND target_type = ?
+                GROUP BY target_id
+            ) s2 ON s1.target_id = s2.target_id AND s1.timestamp = s2.min_ts
+            WHERE s1.guild_id = ? AND s1.target_type = ?
+            """,
+            [guild_id, target_type, guild_id, target_type],
+        )
+
+    async def _get_latest_guild_snapshot(
+        self, store, guild_id: str
+    ) -> dict[str, Any] | None:
+        """取得攻擊前最近的 guild 快照（名稱/縮圖/橫幅）。
+
+        若不存在 5 分鐘前的資料，退回使用最早的快照。
+        """
+        rows = await store.fetchall(
+            """
+            SELECT snapshot_data
+            FROM structure_snapshots
+            WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
+              AND timestamp <= (strftime('%s', 'now') - ?)
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [guild_id, guild_id, _RECOVERY_LOOKBACK],
+        )
+        if not rows:
+            logger.warning(
+                "No pre-attack guild snapshot found guild=%s — falling back to earliest",
+                guild_id,
+            )
+            rows = await store.fetchall(
+                """
+                SELECT snapshot_data
+                FROM structure_snapshots
+                WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
+                ORDER BY timestamp ASC
+                LIMIT 1
+                """,
+                [guild_id, guild_id],
+            )
+        if rows:
+            try:
+                return json.loads(rows[0]["snapshot_data"])
+            except Exception:
+                pass
+
+        # 舊版資料可能把 after-state 寫進 structure_snapshots，
+        # 這裡退回用 temp_cache 的 old_data（攻擊前狀態）。
+        fallback_rows = await store.fetchall(
+            """
+            SELECT old_data
+            FROM temp_cache
+            WHERE guild_id = ? AND event_type = 'guild_update'
+              AND old_data IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            [guild_id],
+        )
+        if not fallback_rows:
+            return None
+        try:
+            return json.loads(fallback_rows[0]["old_data"])
+        except Exception:
+            return None
+
+    async def _fetch_asset_bytes(self, url: str | None) -> bytes | None:
+        """下載快照中的圖片資源供 guild.edit 使用。"""
+        if not url:
+            return None
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=15) as resp:
+                    if resp.status != 200:
+                        return None
+                    return await resp.read()
+        except Exception:
+            return None
+
+    async def _restore_guild_profile(
+        self, guild: discord.Guild, snapshot: dict[str, Any] | None
+    ) -> None:
+        """還原伺服器名稱、縮圖與橫幅。"""
+        if not snapshot:
+            logger.info("No guild profile snapshot found guild=%s", guild.id)
+            return
+
+        target_name = snapshot.get("name") or guild.name
+        icon_url = snapshot.get("icon_url")
+        banner_url = snapshot.get("banner_url")
+
+        icon_bytes = await self._fetch_asset_bytes(icon_url) if icon_url else None
+        banner_bytes = await self._fetch_asset_bytes(banner_url) if banner_url else None
+
+        try:
+            kwargs: dict[str, Any] = {"name": target_name}
+            if icon_url is None:
+                # 快照顯示原本沒有縮圖，清除目前縮圖。
+                kwargs["icon"] = None
+            elif icon_bytes is not None:
+                kwargs["icon"] = icon_bytes
+            if banner_url is None:
+                # 快照顯示原本沒有橫幅，清除目前橫幅。
+                kwargs["banner"] = None
+            elif banner_bytes is not None:
+                kwargs["banner"] = banner_bytes
+
+            await rate_limited_call(guild.edit, **kwargs)
+            logger.info(
+                "Guild profile restored guild=%s name=%s icon=%s banner=%s",
+                guild.id,
+                target_name,
+                bool(icon_bytes),
+                bool(banner_bytes),
+            )
+        except discord.Forbidden:
+            logger.warning(
+                "Skip guild profile restore due to missing permissions guild=%s",
+                guild.id,
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Guild profile restore failed guild=%s: %s",
+                guild.id,
+                exc,
+                exc_info=True,
+            )
 
     # -------------------------------------------------------- 頻道復原
 
     async def _restore_channels(
-        self, guild: discord.Guild, snapshots: list[dict]
+        self, guild: discord.Guild, channel_data_list: list[dict]
     ) -> int:
-        """依快照重建或修正頻道設定。"""
+        """依快照重建或修正頻道設定。接受已解析的快照 dict 清單。"""
         restored = 0
         current = {str(ch.id): ch for ch in guild.channels}
 
         logger.info(
             "Restoring channels guild=%s snapshots=%s current_channels=%s",
             guild.id,
-            len(snapshots),
+            len(channel_data_list),
             len(current),
         )
 
-        for row in snapshots:
-            data = json.loads(row["snapshot_data"])
+        async def _restore_one_channel(data: dict) -> int:
             channel_id = data["channel_id"]
             existing = current.get(channel_id)
 
@@ -267,8 +642,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         data.get("name"),
                     )
                     await rate_limited_call(self._update_channel, guild, existing, data)
-                restored += 1
                 await asyncio.sleep(CHANNEL_OP_DELAY)
+                return 1
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Restore channel failed guild=%s channel_id=%s name=%s: %s",
@@ -278,7 +653,13 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     exc,
                     exc_info=True,
                 )
+                return 0
 
+        results = await self._gather_bounded(
+            [_restore_one_channel(data) for data in channel_data_list],
+            _CHANNEL_RESTORE_CONCURRENCY,
+        )
+        restored = sum(results)
         return restored
 
     async def _recreate_channel(
@@ -354,22 +735,346 @@ class RecoveryCog(commands.Cog, name="Recovery"):
 
     # -------------------------------------------------------- 身分組復原
 
+    async def _execute_recovery(
+        self, store, guild: discord.Guild, request_id: str | None = None
+    ) -> tuple[int, int, int]:
+        """完整還原流程（依序）：
+
+        1. 從 D1 預載所有快照資料到記憶體（並嘗試寫入 Redis 熱快取）。
+        2. 刪除快照中不存在的多餘身分組／頻道。
+        3. 還原：伺服器名稱/橫幅 → 身分組屬性 → 身分組成員 → 頻道 → 訊息。
+        4. 解除快照的保留標記（pinned）。
+        """
+        guild_id = str(guild.id)
+
+        # ── Step 1: 預載快照資料到記憶體 ────────────────────────────────
+        guild_snap = await self._get_latest_guild_snapshot(store, guild_id)
+        channel_snaps = await self._get_pre_attack_snapshots(store, guild_id, "channel")
+        role_snaps = await self._get_pre_attack_snapshots(store, guild_id, "role")
+        member_snaps = await self._get_pre_attack_snapshots(store, guild_id, "member")
+
+        channel_data_list: list[dict] = [json.loads(r["snapshot_data"]) for r in channel_snaps]
+        role_data_list: list[dict] = [json.loads(r["snapshot_data"]) for r in role_snaps]
+        member_data_list: list[dict] = [json.loads(r["snapshot_data"]) for r in member_snaps]
+
+        # 嘗試寫入 Redis（如可用）；失敗時僅使用記憶體快取繼續執行。
+        await self._cache_snapshots_to_redis(store, guild_id, request_id, channel_data_list, role_data_list)
+
+        snapshot_channel_ids = {d["channel_id"] for d in channel_data_list}
+        snapshot_role_ids = {d["role_id"] for d in role_data_list}
+
+        logger.info(
+            "Recovery snapshots loaded guild=%s request_id=%s channels=%s roles=%s",
+            guild_id, request_id, len(channel_data_list), len(role_data_list),
+        )
+
+        # ── Step 2: 刪除快照中不存在的多餘身分組、頻道 ─────────────────
+        await self._delete_extra_roles(guild, snapshot_role_ids)
+        await self._delete_extra_channels(guild, snapshot_channel_ids)
+
+        # ── Step 3: 依序還原 ─────────────────────────────────────────────
+        # 3a. 伺服器名稱 / 橫幅
+        await self._restore_guild_profile(guild, guild_snap)
+        # 3b. 身分組屬性
+        restored_ro = await self._restore_roles(guild, role_data_list)
+        # 3c. 身分組成員
+        await self._restore_role_members(guild, role_data_list)
+        # 3c-2. 成員暱稱（404 找不到使用者時忽略）
+        await self._restore_member_nicks(guild, member_data_list)
+        # 3d. 頻道
+        restored_ch = await self._restore_channels(guild, channel_data_list)
+        # 3e. 訊息
+        restored_ms = await self._restore_messages(store, guild)
+
+        # ── Step 4: 解除快照保留標記 ─────────────────────────────────────
+        await self._unpin_snapshots(store, guild_id)
+
+        logger.info(
+            "Recovery finished guild=%s request_id=%s channels=%d roles=%d messages=%d",
+            guild_id, request_id, restored_ch, restored_ro, restored_ms,
+        )
+        return restored_ch, restored_ro, restored_ms
+
+    # -------------------------------------------------------- 快取與輔助工具
+
+    async def _cache_snapshots_to_redis(
+        self,
+        store,
+        guild_id: str,
+        request_id: str | None,
+        channel_data_list: list[dict],
+        role_data_list: list[dict],
+    ) -> None:
+        """嘗試將快照資料寫入 Redis 熱快取（TTL 1 小時）。
+
+        若 Redis 不可用或寫入失敗，僅記錄警告並繼續使用記憶體快取。
+        如資料量過大，分批寫入（每批最多 50 筆）。
+        """
+        redis = getattr(store, "_redis", None)
+        if redis is None:
+            logger.debug("Redis unavailable — using in-memory snapshots only")
+            return
+        prefix = f"recovery:{request_id or guild_id}"
+        batch: list = []
+        for d in channel_data_list:
+            batch.append(f"{prefix}:channel:{d['channel_id']}")
+            batch.append(json.dumps(d, ensure_ascii=False))
+        for d in role_data_list:
+            batch.append(f"{prefix}:role:{d['role_id']}")
+            batch.append(json.dumps(d, ensure_ascii=False))
+        # 分批 MSET，每次最多 50 個 key-value 對（100 個元素）。
+        chunk_size = 100
+        try:
+            for i in range(0, len(batch), chunk_size):
+                chunk = batch[i : i + chunk_size]
+                pairs = {chunk[j]: chunk[j + 1] for j in range(0, len(chunk), 2)}
+                await redis.mset(pairs)
+            # 為每個 key 設定 TTL。
+            for i in range(0, len(batch), 2):
+                await redis.expire(batch[i], 3600)
+            logger.info(
+                "Cached %d snapshot(s) to Redis guild=%s request_id=%s",
+                len(batch) // 2, guild_id, request_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis cache write failed guild=%s request_id=%s: %s — continuing with memory",
+                guild_id, request_id, exc,
+            )
+
+    async def _delete_extra_channels(
+        self, guild: discord.Guild, snapshot_channel_ids: set[str]
+    ) -> None:
+        """刪除在快照中不存在的多餘頻道（還原前清場）。"""
+        # 先刪一般頻道再刪分類，避免殘留。
+        non_categories = [
+            ch for ch in guild.channels
+            if str(ch.id) not in snapshot_channel_ids
+            and not isinstance(ch, discord.CategoryChannel)
+        ]
+        categories = [
+            ch for ch in guild.channels
+            if str(ch.id) not in snapshot_channel_ids
+            and isinstance(ch, discord.CategoryChannel)
+        ]
+        extra_channels = non_categories + categories
+
+        async def _delete_channel(channel) -> None:
+            try:
+                await rate_limited_call(
+                    channel.delete,
+                    reason="Recovery: channel not in pre-attack snapshot",
+                )
+                logger.info(
+                    "Deleted extra channel guild=%s channel=%s name=%s",
+                    guild.id, channel.id, channel.name,
+                )
+                await asyncio.sleep(CHANNEL_OP_DELAY)
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot delete extra channel (forbidden) guild=%s channel=%s",
+                    guild.id, channel.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to delete extra channel guild=%s channel=%s: %s",
+                    guild.id, channel.id, exc, exc_info=True,
+                )
+
+        await self._gather_bounded(
+            [_delete_channel(channel) for channel in extra_channels],
+            _CHANNEL_DELETE_CONCURRENCY,
+        )
+
+        # 補刪公開討論串（threads），避免「有一個頻道沒刪到」的殘留。
+        async def _delete_thread(thread: discord.Thread) -> None:
+            try:
+                await rate_limited_call(
+                    thread.delete,
+                    reason="Recovery: thread not in pre-attack snapshot",
+                )
+                logger.info(
+                    "Deleted extra thread guild=%s thread=%s name=%s",
+                    guild.id, thread.id, thread.name,
+                )
+                await asyncio.sleep(CHANNEL_OP_DELAY)
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot delete extra thread (forbidden) guild=%s thread=%s",
+                    guild.id, thread.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to delete extra thread guild=%s thread=%s: %s",
+                    guild.id, thread.id, exc, exc_info=True,
+                )
+
+        await self._gather_bounded(
+            [_delete_thread(thread) for thread in list(guild.threads)],
+            _CHANNEL_DELETE_CONCURRENCY,
+        )
+
+    async def _delete_extra_roles(
+        self, guild: discord.Guild, snapshot_role_ids: set[str]
+    ) -> None:
+        """刪除在快照中不存在的多餘身分組（還原前清場）。"""
+        bot_member = guild.me
+        targets = []
+        for role in list(guild.roles):
+            if role.is_default() or role.managed:
+                continue
+            if bot_member and role >= bot_member.top_role:
+                continue
+            if str(role.id) in snapshot_role_ids:
+                continue
+            targets.append(role)
+
+        async def _delete_role(role: discord.Role) -> None:
+            try:
+                await rate_limited_call(
+                    role.delete,
+                    reason="Recovery: role not in pre-attack snapshot",
+                )
+                logger.info(
+                    "Deleted extra role guild=%s role=%s name=%s",
+                    guild.id, role.id, role.name,
+                )
+                await asyncio.sleep(ROLE_OP_DELAY)
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot delete extra role (forbidden) guild=%s role=%s",
+                    guild.id, role.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to delete extra role guild=%s role=%s: %s",
+                    guild.id, role.id, exc, exc_info=True,
+                )
+
+        await self._gather_bounded(
+            [_delete_role(role) for role in targets],
+            _ROLE_DELETE_CONCURRENCY,
+        )
+
+    async def _restore_member_nicks(
+        self,
+        guild: discord.Guild,
+        member_data_list: list[dict],
+    ) -> None:
+        """還原成員暱稱；找不到使用者（404/不在伺服器）時忽略。"""
+
+        async def _restore_one(data: dict) -> None:
+            uid = data.get("user_id")
+            if not uid or not str(uid).isdigit():
+                return
+            member = guild.get_member(int(uid))
+            if member is None:
+                return
+            target_nick = data.get("nick")
+            if member.nick == target_nick:
+                return
+            try:
+                await rate_limited_call(
+                    member.edit,
+                    nick=target_nick,
+                    reason="Recovery: restore nickname",
+                )
+                await asyncio.sleep(ROLE_OP_DELAY)
+            except discord.NotFound:
+                # 404: 使用者已離開或找不到，忽略。
+                return
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot restore nick guild=%s user=%s",
+                    guild.id,
+                    uid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Restore nick failed guild=%s user=%s: %s",
+                    guild.id,
+                    uid,
+                    exc,
+                )
+
+        await self._gather_bounded(
+            [_restore_one(data) for data in member_data_list],
+            _ROLE_MEMBER_RESTORE_CONCURRENCY,
+        )
+
+    async def _restore_role_members(
+        self, guild: discord.Guild, role_data_list: list[dict]
+    ) -> None:
+        """依快照將身分組補發給原有成員。
+
+        快照中 members 欄位記錄了快照當時各身分組的成員 ID；
+        此步驟確保成員在攻擊期間被移除的身分組能被恢復。
+        """
+        async def _restore_one(member: discord.Member, role: discord.Role, uid_str: str) -> None:
+            try:
+                await rate_limited_call(
+                    member.add_roles,
+                    role,
+                    reason="Recovery: restoring role membership",
+                )
+                await asyncio.sleep(ROLE_OP_DELAY)
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot add role guild=%s role=%s member=%s",
+                    guild.id, role.id, uid_str,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to restore role member guild=%s role=%s member=%s: %s",
+                    guild.id, role.id, uid_str, exc, exc_info=True,
+                )
+
+        jobs = []
+        for data in role_data_list:
+            role_id = data["role_id"]
+            member_ids: list[str] = data.get("members", [])
+            if not member_ids:
+                continue
+            role = guild.get_role(int(role_id))
+            if not role:
+                continue
+            for uid_str in member_ids:
+                member = guild.get_member(int(uid_str))
+                if not member:
+                    continue
+                if role in member.roles:
+                    continue
+                jobs.append(_restore_one(member, role, uid_str))
+
+        await self._gather_bounded(jobs, _ROLE_MEMBER_RESTORE_CONCURRENCY)
+
+    async def _unpin_snapshots(self, store, guild_id: str) -> None:
+        """解除此 guild 所有 pinned 快照的保留標記。"""
+        try:
+            await store.execute(
+                "UPDATE structure_snapshots SET pinned = 0 WHERE guild_id = ? AND pinned = 1",
+                [guild_id],
+            )
+            logger.info("Unpinned snapshots guild=%s", guild_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to unpin snapshots guild=%s: %s", guild_id, exc, exc_info=True)
+
     async def _restore_roles(
-        self, guild: discord.Guild, snapshots: list[dict]
+        self, guild: discord.Guild, role_data_list: list[dict]
     ) -> int:
-        """依快照重建或修正身分組設定。"""
+        """依快照重建或修正身分組設定。接受已解析的快照 dict 清單。"""
         restored = 0
         current = {str(r.id): r for r in guild.roles}
+        bot_member = guild.me
 
         logger.info(
             "Restoring roles guild=%s snapshots=%s current_roles=%s",
             guild.id,
-            len(snapshots),
+            len(role_data_list),
             len(current),
         )
 
-        for row in snapshots:
-            data = json.loads(row["snapshot_data"])
+        async def _restore_one_role(data: dict) -> int:
             role_id = data["role_id"]
             existing = current.get(role_id)
 
@@ -381,7 +1086,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         role_id,
                         data.get("name"),
                     )
-                    await rate_limited_call(guild.create_role,
+                    await rate_limited_call(
+                        guild.create_role,
                         name=data["name"],
                         permissions=discord.Permissions(int(data["permissions"])),
                         color=discord.Color(data["color"]),
@@ -398,7 +1104,16 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                             guild.id,
                             role_id,
                         )
-                        continue
+                        return 0
+                    if bot_member is not None and existing >= bot_member.top_role:
+                        logger.warning(
+                            "Skipping role restore due to hierarchy guild=%s role_id=%s role=%s bot_top_role=%s",
+                            guild.id,
+                            role_id,
+                            existing.name,
+                            bot_member.top_role.name,
+                        )
+                        return 0
                     logger.info(
                         "Updating existing role guild=%s role_id=%s name=%s",
                         guild.id,
@@ -413,8 +1128,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         hoist=data["hoist"],
                         mentionable=data["mentionable"],
                     )
-                restored += 1
                 await asyncio.sleep(ROLE_OP_DELAY)
+                return 1
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Restore role failed guild=%s role_id=%s name=%s: %s",
@@ -424,7 +1139,13 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     exc,
                     exc_info=True,
                 )
+                return 0
 
+        results = await self._gather_bounded(
+            [_restore_one_role(data) for data in role_data_list],
+            _ROLE_RESTORE_CONCURRENCY,
+        )
+        restored = sum(results)
         return restored
 
     # -------------------------------------------------------- 訊息復原
@@ -435,7 +1156,6 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         """將舊頻道加密訊息重送到新頻道，附還原時間標記。"""
         guild_id = str(guild.id)
 
-        # 找出近 5 分鐘內被刪除的頻道
         deleted = await store.fetchall(
             """
             SELECT DISTINCT target_id, old_data FROM temp_cache
@@ -454,19 +1174,16 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             len(deleted),
         )
 
-        restored = 0
-        for event in deleted:
+        async def _restore_one_deleted_channel(event: dict[str, Any]) -> int:
             old_ch_id = event["target_id"]
             ch_data = json.loads(event["old_data"]) if event["old_data"] else {}
             ch_name = ch_data.get("name", "unknown")
 
-            # 以名稱找回剛重建的新頻道
             new_channel = discord.utils.get(guild.text_channels, name=ch_name)
             if new_channel is None:
                 logger.warning("No recreated channel '%s' for message restore", ch_name)
-                continue
+                return 0
 
-            # 讀取舊頻道加密訊息
             messages = await store.fetchall(
                 """
                 SELECT * FROM encrypted_messages
@@ -482,9 +1199,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     old_ch_id,
                     ch_name,
                 )
-                continue
+                return 0
 
-            # 訊息數量上限保護
             messages = messages[-_MAX_RESTORE_MESSAGES:]
             logger.info(
                 "Preparing message restore guild=%s old_channel=%s new_channel=%s messages=%s",
@@ -494,11 +1210,11 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 len(messages),
             )
 
-            # 建立或重用 webhook
             webhook = await self._get_or_create_webhook(new_channel)
             if webhook is None:
-                continue
+                return 0
 
+            channel_restored = 0
             for msg in messages:
                 try:
                     content = decrypt(msg["encrypted_content"], msg["nonce"])
@@ -509,7 +1225,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         username=msg["author_name"],
                         avatar_url=msg.get("author_avatar"),
                     )
-                    restored += 1
+                    channel_restored += 1
                     await asyncio.sleep(_WEBHOOK_SEND_DELAY)
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
@@ -521,8 +1237,13 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         exc,
                         exc_info=True,
                     )
+            return channel_restored
 
-        return restored
+        results = await self._gather_bounded(
+            [_restore_one_deleted_channel(event) for event in deleted],
+            _MESSAGE_RESTORE_CHANNEL_CONCURRENCY,
+        )
+        return sum(results)
 
     async def _get_or_create_webhook(
         self, channel: discord.TextChannel

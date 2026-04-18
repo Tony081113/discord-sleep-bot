@@ -65,6 +65,7 @@ _TABLES_DDL: list[str] = [
         target_id     TEXT NOT NULL,
         snapshot_data TEXT NOT NULL,
         timestamp     INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        pinned        INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
     )
     """,
@@ -129,6 +130,19 @@ _TABLES_DDL: list[str] = [
     )
     """,
     # ------------------------------------------------------------------
+    # guild_defense_state — per-guild defense toggle with auto-resume
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS guild_defense_state (
+        guild_id       TEXT PRIMARY KEY,
+        is_enabled     INTEGER NOT NULL DEFAULT 1,
+        disabled_until INTEGER,
+        updated_by     TEXT,
+        updated_at     INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
+    )
+    """,
+    # ------------------------------------------------------------------
     # recovery_requests — recovery approval workflow
     # ------------------------------------------------------------------
     """
@@ -143,6 +157,8 @@ _TABLES_DDL: list[str] = [
         result_channels INTEGER DEFAULT 0,
         result_roles    INTEGER DEFAULT 0,
         result_messages INTEGER DEFAULT 0,
+        alert_msg_ids   TEXT DEFAULT NULL,
+        attacker_ids    TEXT DEFAULT NULL,
         created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
         resolved_at     INTEGER,
         FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
@@ -178,5 +194,20 @@ async def init_schema(store: DataStore) -> None:
 
     for ddl in _TABLES_DDL:
         await store.execute(ddl)
+
+    # ---------------------------------------------------------------------------
+    # Migrations — ADD COLUMN is idempotent on success; ignore if already exists.
+    # ---------------------------------------------------------------------------
+    _MIGRATIONS = [
+        "ALTER TABLE structure_snapshots ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE recovery_requests ADD COLUMN alert_msg_ids TEXT DEFAULT NULL",
+        "ALTER TABLE recovery_requests ADD COLUMN attacker_ids TEXT DEFAULT NULL",
+    ]
+    for migration in _MIGRATIONS:
+        try:
+            await store.execute(migration)
+            logger.info("Migration applied: %s", migration[:60])
+        except Exception:  # column already exists or other benign error
+            pass
 
     logger.info("Schema initialised (%d tables)", len(_TABLES_DDL))

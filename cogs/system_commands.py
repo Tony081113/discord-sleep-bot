@@ -4,6 +4,7 @@
 - /ping   ：顯示 Discord API 延遲
 - /status ：顯示 Redis / D1 連線與延遲
 - /panel  ：顯示管理面板網址
+- /defense：切換防禦系統啟停
 """
 
 from time import perf_counter
@@ -13,6 +14,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from mods.defense import (
+    DEFAULT_DISABLE_SECONDS,
+    get_defense_state,
+    set_defense_disabled,
+    set_defense_enabled,
+)
 from mods.logger import setup_logger
 from mods.storage import get_storage
 
@@ -104,6 +111,74 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
             color=discord.Color.from_str("#8b7ec8"),
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="defense", description="暫停或啟用自動防禦系統")
+    @app_commands.describe(action="要執行的操作")
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="查看狀態", value="status"),
+            app_commands.Choice(name="暫時關閉（1 小時）", value="disable"),
+            app_commands.Choice(name="立即啟用", value="enable"),
+        ]
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def defense(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+    ) -> None:
+        """管理防禦系統狀態。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("❌ 此指令只能在伺服器內使用。", ephemeral=True)
+            return
+
+        store = get_storage()
+        guild_id = str(guild.id)
+        user_id = str(interaction.user.id)
+
+        if action.value == "disable":
+            state = await set_defense_disabled(
+                store,
+                guild_id,
+                user_id,
+                duration_seconds=DEFAULT_DISABLE_SECONDS,
+            )
+            until = state["disabled_until"]
+            await interaction.followup.send(
+                (
+                    "🛑 防禦系統已暫時關閉。\n"
+                    f"將於 <t:{until}:R> 自動恢復（<t:{until}:f>）。\n"
+                    "你也可以隨時用 `/defense` 選擇「立即啟用」。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if action.value == "enable":
+            await set_defense_enabled(store, guild_id, user_id)
+            await interaction.followup.send(
+                "✅ 防禦系統已重新啟用。",
+                ephemeral=True,
+            )
+            return
+
+        state = await get_defense_state(store, guild_id)
+        if state["enabled"]:
+            await interaction.followup.send("✅ 目前防禦系統為啟用中。", ephemeral=True)
+            return
+
+        until = state["disabled_until"]
+        await interaction.followup.send(
+            (
+                "🛑 目前防禦系統為暫停中。\n"
+                f"預計 <t:{until}:R> 自動恢復（<t:{until}:f>）。"
+            ),
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

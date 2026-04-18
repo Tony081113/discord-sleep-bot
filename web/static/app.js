@@ -48,6 +48,15 @@ function relTime(ts) {
   return `${Math.floor(diff / 86400)} 天前`;
 }
 
+function fmtDuration(seconds) {
+  if (!seconds || seconds <= 0) return '0 分鐘';
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分鐘`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.ceil((seconds % 3600) / 60);
+  return m > 0 ? `${h} 小時 ${m} 分鐘` : `${h} 小時`;
+}
+
 function getGreeting(name) {
   const h = new Date().getHours();
   if (h >= 5  && h < 12) return `早安，<strong>${esc(name)}</strong>。今天的伺服器一切平靜`;
@@ -303,13 +312,30 @@ function attachLogHandlers(el) {
 // ── Page: recovery ───────────────────────────────────────
 async function pageRecovery(el) {
   try {
-    const data = await api(`/api/guilds/${S.guild}/recovery-requests`);
+    const [data, defenseResp] = await Promise.all([
+      api(`/api/guilds/${S.guild}/recovery-requests`),
+      api(`/api/guilds/${S.guild}/defense-status`),
+    ]);
     const reqs = data.requests || [];
     const pending = reqs.filter(r => r.status === 'pending');
     const history = reqs.filter(r => r.status !== 'pending');
+    const defense = defenseResp.defense || { enabled: true };
 
     el.innerHTML = `
       <div class="page-header"><h2>復原管理</h2><button class="btn btn-ghost btn-sm" id="refreshRecovery">↻ 重新整理</button></div>
+      <div class="manual-section" style="margin-bottom:1.2rem;">
+        <div class="info">
+          <h3>${defense.enabled ? '🛡️ 防禦系統目前啟用中' : '🛑 防禦系統目前暫停中'}</h3>
+          <p>
+            ${defense.enabled
+              ? '異常偵測與自動防禦正在運作。'
+              : `預計 ${fmtDuration(defense.remaining_seconds)} 後自動恢復。${defense.disabled_until ? `（${fmtTime(defense.disabled_until)}）` : ''}`}
+          </p>
+        </div>
+        <button class="btn ${defense.enabled ? 'btn-danger' : 'btn-success'}" id="toggleDefenseRecovery">
+          ${defense.enabled ? '暫時關閉 1 小時' : '立即重新啟用'}
+        </button>
+      </div>
       <div class="manual-section">
         <div class="info">
           <h3>🔧 手動復原</h3>
@@ -327,6 +353,13 @@ async function pageRecovery(el) {
       </div>`;
 
     el.querySelector('#refreshRecovery')?.addEventListener('click', () => pageRecovery(el));
+    el.querySelector('#toggleDefenseRecovery')?.addEventListener('click', async () => {
+      if (defense.enabled) {
+        await disableDefense(el, pageRecovery);
+      } else {
+        await enableDefense(el, pageRecovery);
+      }
+    });
     el.querySelector('#manualRecovery')?.addEventListener('click', () => doManualRecovery(el));
     el.querySelectorAll('[data-approve]').forEach(btn => {
       btn.addEventListener('click', () => doApprove(btn.dataset.approve, el));
@@ -403,8 +436,12 @@ async function doManualRecovery(el) {
 // ── Page: thresholds ─────────────────────────────────────
 async function pageThresholds(el) {
   try {
-    const data = await api(`/api/guilds/${S.guild}/thresholds`);
+    const [data, defenseResp] = await Promise.all([
+      api(`/api/guilds/${S.guild}/thresholds`),
+      api(`/api/guilds/${S.guild}/defense-status`),
+    ]);
     const items = data.thresholds || [];
+    const defense = defenseResp.defense || { enabled: true };
     const fmtWindow = (seconds) => {
       if (!seconds || seconds <= 0) return '5 分鐘';
       if (seconds % 60 === 0) return `${seconds / 60} 分鐘`;
@@ -424,6 +461,19 @@ async function pageThresholds(el) {
 
     el.innerHTML = `
       <div class="page-header"><h2>門檻設定</h2></div>
+      <div class="manual-section" style="margin-bottom:1.2rem;">
+        <div class="info">
+          <h3>${defense.enabled ? '🛡️ 防禦系統目前啟用中' : '🛑 防禦系統目前暫停中'}</h3>
+          <p>
+            ${defense.enabled
+              ? '異常偵測與自動防禦正在運作。'
+              : `預計 ${fmtDuration(defense.remaining_seconds)} 後自動恢復。${defense.disabled_until ? `（${fmtTime(defense.disabled_until)}）` : ''}`}
+          </p>
+        </div>
+        <button class="btn ${defense.enabled ? 'btn-danger' : 'btn-success'}" id="toggleDefense">
+          ${defense.enabled ? '暫時關閉 1 小時' : '立即重新啟用'}
+        </button>
+      </div>
       <p style="color:var(--text-3);font-size:.85rem;margin-bottom:1.3rem;">
         當某類事件在其對應時間窗內超過門檻次數時，系統會觸發異常警報並建立復原請求。<br>
         數值越低越敏感，越高越寬鬆。調太低可能會誤報，請斟酌設定。
@@ -431,10 +481,61 @@ async function pageThresholds(el) {
       <div class="threshold-grid">${cards}</div>
       <button class="btn btn-primary" id="saveThresholds">💾 儲存設定</button>`;
 
+    el.querySelector('#toggleDefense')?.addEventListener('click', async () => {
+      if (defense.enabled) {
+        await disableDefense(el);
+      } else {
+        await enableDefense(el);
+      }
+    });
     el.querySelector('#saveThresholds')?.addEventListener('click', () => saveThresholds(el));
   } catch (e) {
     if (e.message === 'unauthorized') return;
     el.innerHTML = emptyHTML('😴', randomError());
+  }
+}
+
+async function disableDefense(el, rerender = pageThresholds) {
+  const ok = await showConfirm(
+    '暫時關閉防禦系統',
+    '防禦系統會暫停 1 小時（手動復原仍可使用），並在時間到後自動恢復。是否繼續？'
+  );
+  if (!ok) return;
+
+  const btn = el.querySelector('#toggleDefense') || el.querySelector('#toggleDefenseRecovery');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api(`/api/guilds/${S.guild}/defense/disable`, {
+      method: 'POST',
+      body: JSON.stringify({ duration_seconds: 3600 }),
+    });
+    const until = res.defense?.disabled_until;
+    toast(
+      until
+        ? `防禦系統已暫停，將於 ${fmtTime(until)} 自動恢復`
+        : '防禦系統已暫停 1 小時',
+      'info'
+    );
+    rerender(el);
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function enableDefense(el, rerender = pageThresholds) {
+  const ok = await showConfirm('啟用防禦系統', '確定要立即重新啟用防禦系統嗎？');
+  if (!ok) return;
+
+  const btn = el.querySelector('#toggleDefense') || el.querySelector('#toggleDefenseRecovery');
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/api/guilds/${S.guild}/defense/enable`, { method: 'POST' });
+    toast('防禦系統已重新啟用', 'success');
+    rerender(el);
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) btn.disabled = false;
   }
 }
 

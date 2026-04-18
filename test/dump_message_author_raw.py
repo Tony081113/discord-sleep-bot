@@ -19,7 +19,7 @@ from typing import Any
 import discord
 from dotenv import load_dotenv
 
-TARGET_GUILD_ID = 1493561394422087743
+TARGET_GUILD_ID = 1494928504901341328
 OUTPUT_PATH = Path(__file__).resolve().parent / "output_authors.jsonl"
 
 
