@@ -113,6 +113,54 @@ _TABLES_DDL: list[str] = [
         timestamp  INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
     )
     """,
+    # ------------------------------------------------------------------
+    # guild_thresholds — per-guild anomaly detection thresholds
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS guild_thresholds (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id        TEXT NOT NULL,
+        event_type      TEXT NOT NULL,
+        threshold_value INTEGER NOT NULL,
+        updated_by      TEXT,
+        updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE,
+        UNIQUE (guild_id, event_type)
+    )
+    """,
+    # ------------------------------------------------------------------
+    # recovery_requests — recovery approval workflow
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS recovery_requests (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id        TEXT NOT NULL,
+        event_type      TEXT NOT NULL,
+        event_count     INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        requested_by    TEXT,
+        approved_by     TEXT,
+        result_channels INTEGER DEFAULT 0,
+        result_roles    INTEGER DEFAULT 0,
+        result_messages INTEGER DEFAULT 0,
+        created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        resolved_at     INTEGER,
+        FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
+    )
+    """,
+    # ------------------------------------------------------------------
+    # maintenance_logs — transparent maintenance notes
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS maintenance_logs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id    TEXT,
+        content     TEXT NOT NULL,
+        author_id   TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    )
+    """,
 ]
 
 

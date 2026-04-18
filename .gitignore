@@ -57,6 +57,7 @@ cover/
 
 # Django stuff:
 *.log
+logs/**
 !logs/.gitkeep
 local_settings.py
 db.sqlite3

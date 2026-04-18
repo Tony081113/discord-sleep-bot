@@ -1,3 +1,4 @@
+#要避免在還原時被429，且還原前要先把搗亂的人踢出(如果發現發訊者不在群內，可能是User install bot)
 """
 Discord bot entry point.
 

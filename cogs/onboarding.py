@@ -1,32 +1,35 @@
-"""
-Onboarding cog — Phase 2.
+﻿"""導入模組（Phase 2）。
 
-Handles:
-1. Initial structure snapshot when the bot joins a guild.
-2. Admin approval DM flow with interactive buttons.
-3. Fallback channel message if DM delivery fails.
+職責：
+1. Bot 加入伺服器時建立初始結構快照。
+2. 提供管理員核准者的私訊互動流程。
+3. 私訊失敗時提供伺服器內備援通知。
+4. 提供管理員手動接受核准者指令。
 """
 
+import asyncio
 import json
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from mods.logger import setup_logger
+from mods.rate_limit import DM_SEND_DELAY
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
 
-# Discord official DM troubleshooting page
+# Discord 官方私訊疑難排解頁面
 _DM_HELP_URL = "https://support.discord.com/hc/en-us/articles/217916488"
 
 
 # ---------------------------------------------------------------------------
-# Serialisation helpers
+# 序列化工具
 # ---------------------------------------------------------------------------
 
 def _channel_to_dict(channel: discord.abc.GuildChannel) -> dict:
-    """Serialise a channel into a JSON-safe dict for snapshot storage."""
+    """將頻道轉成可安全寫入 JSON 的快照資料。"""
     data = {
         "channel_id": str(channel.id),
         "name": channel.name,
@@ -52,7 +55,7 @@ def _channel_to_dict(channel: discord.abc.GuildChannel) -> dict:
 
 
 def _role_to_dict(role: discord.Role) -> dict:
-    """Serialise a role into a JSON-safe dict for snapshot storage."""
+    """將身分組轉成可安全寫入 JSON 的快照資料。"""
     return {
         "role_id": str(role.id),
         "name": role.name,
@@ -69,16 +72,251 @@ def _role_to_dict(role: discord.Role) -> dict:
 # ---------------------------------------------------------------------------
 
 class OnboardingCog(commands.Cog, name="Onboarding"):
-    """Guild join initialisation and admin approval flow."""
+    """處理入群初始化與管理員核准流程。"""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    # ------------------------------------------------- slash commands
+
+    # -------------------------------------------------------- DM verify helpers
+
+    async def _send_verify_dm(
+        self, user: discord.User, guild_id: str
+    ) -> bool:
+        """送出含驗證按鈕的私訊；成功送達回傳 True。"""
+        embed = discord.Embed(
+            title="🔔 復原核准者驗證",
+            description=(
+                "你正在申請成為 **SleepBot** 的復原核准者。\n\n"
+                "點擊下方按鈕即可完成驗證。日後伺服器偵測到異常時，"
+                "復原請求會透過此私訊管道通知你。"
+            ),
+            color=discord.Color.blurple(),
+        )
+        view = discord.ui.View(timeout=None)
+        btn = discord.ui.Button(
+            label="✅ 確認成為核准者",
+            style=discord.ButtonStyle.success,
+            custom_id=f"verify_approver:{guild_id}:{user.id}",
+        )
+        view.add_item(btn)
+        try:
+            await user.send(embed=embed, view=view)
+            return True
+        except discord.Forbidden:
+            return False
+        except discord.HTTPException:
+            return False
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        """集中處理 onboarding 相關按鈕互動入口。"""
+        if interaction.type != discord.InteractionType.component:
+            return
+        custom_id = interaction.data.get("custom_id", "")
+
+        if custom_id.startswith("verify_approver:"):
+            await self._handle_verify_approver(interaction, custom_id)
+        elif custom_id.startswith("resend_approver_dm:"):
+            await self._handle_resend_approver_dm(interaction, custom_id)
+        elif custom_id.startswith("accept_approver:"):
+            await self._handle_accept_approver(interaction, custom_id)
+        elif custom_id.startswith("retry_dm:"):
+            await self._handle_retry_dm(interaction, custom_id)
+
+    async def _handle_verify_approver(
+        self, interaction: discord.Interaction, custom_id: str
+    ) -> None:
+        """當使用者點擊私訊驗證按鈕時，註冊為核准者。"""
+        parts = custom_id.split(":")
+        if len(parts) < 3:
+            logger.warning("verify_approver: invalid custom_id=%s", custom_id)
+            return
+        guild_id, user_id = parts[1], parts[2]
+        logger.info(
+            "verify_approver: guild=%s user=%s interactor=%s",
+            guild_id, user_id, interaction.user.id,
+        )
+        if str(interaction.user.id) != user_id:
+            await interaction.response.send_message("❌ 這個按鈕不屬於你。", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer()
+            store = get_storage()
+            await store.execute(
+                """
+                INSERT INTO recovery_approvers (guild_id, user_id)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id, user_id) DO NOTHING
+                """,
+                [guild_id, user_id],
+            )
+            # 驗證成功後嘗試編輯原訊息，避免按鈕被重複點擊。
+            try:
+                await interaction.message.edit(
+                    content="✅ 驗證成功！你已成為此伺服器的復原核准者。\n日後復原請求將透過私訊通知你。",
+                    embed=None,
+                    view=discord.ui.View(),
+                )
+            except Exception as edit_exc:
+                logger.warning("Could not edit verify DM message: %s", edit_exc)
+            await interaction.followup.send(
+                "✅ 驗證成功！你已成為此伺服器的復原核准者。",
+            )
+            logger.info("User %s verified as approver for guild %s via DM button", user_id, guild_id)
+        except Exception as exc:
+            logger.exception("Failed to verify approver: %s", exc)
+            try:
+                await interaction.followup.send("❌ 驗證失敗，請稍後重試。", ephemeral=True)
+            except Exception:
+                pass
+    async def _handle_resend_approver_dm(
+        self, interaction: discord.Interaction, custom_id: str
+    ) -> None:
+        """點擊重新發送按鈕時，補發驗證私訊。"""
+        parts = custom_id.split(":")
+        if len(parts) < 3:
+            return
+        guild_id, user_id = parts[1], parts[2]
+        if str(interaction.user.id) != user_id:
+            await interaction.response.send_message("❌ 這個按鈕不屬於你。", ephemeral=True)
+            return
+        sent = await self._send_verify_dm(interaction.user, guild_id)
+        if sent:
+            await interaction.response.send_message(
+                "📨 已重新發送驗證私訊，請查看 DM 並點擊按鈕完成驗證。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ 仍然無法發送私訊，請確認已開啟「允許伺服器成員傳送私訊」後再試。",
+                ephemeral=True,
+            )
+
+    # -------------------------------------------------------- slash commands
+
+    @app_commands.command(name="accept-approver", description="接受『復原核准者』角色")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def accept_approver(self, interaction: discord.Interaction) -> None:
+        """允許管理員手動接受復原核准者身份。"""
+        try:
+            guild_id = str(interaction.guild_id)
+            user_id = str(interaction.user.id)
+            store = get_storage()
+            guild = interaction.guild
+
+            await interaction.response.defer(ephemeral=True)
+
+            # 先確保 guild 基本資料存在，後續查詢才有一致主檔。
+            if guild:
+                await store.execute(
+                    """
+                    INSERT INTO guilds (guild_id, name, owner_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name
+                    """,
+                    [guild_id, guild.name, str(guild.owner_id) if guild.owner_id else user_id],
+                )
+
+            # 已是核准者就直接返回，避免重複建立紀錄。
+            existing = await store.fetchone(
+                "SELECT 1 FROM recovery_approvers WHERE guild_id = ? AND user_id = ?",
+                [guild_id, user_id],
+            )
+            if existing:
+                await interaction.followup.send(
+                    "ℹ️ 你已經是此伺服器的復原核准者了，無需重複驗證。",
+                    ephemeral=True,
+                )
+                return
+
+            # 以私訊完成核准者身分驗證。
+            sent = await self._send_verify_dm(interaction.user, guild_id)
+
+            if sent:
+                # 私訊成功時同時提供「重送」按鈕，降低遺漏訊息情境。
+                view = discord.ui.View(timeout=None)
+                resend_btn = discord.ui.Button(
+                    label="📨 沒收到？重新發送",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"resend_approver_dm:{guild_id}:{user_id}",
+                )
+                view.add_item(resend_btn)
+                await interaction.followup.send(
+                    "📩 已發送驗證私訊！請查看 DM 並點擊按鈕完成驗證。\n"
+                    "若沒有收到私訊，請點擊下方按鈕重試。",
+                    view=view,
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ 無法向你發送私訊，請先開啟「允許伺服器成員傳送私訊」後再重試。",
+                    ephemeral=True,
+                )
+            logger.info(
+                "User %s requested approver verification for guild %s (dm_sent=%s)",
+                user_id, guild_id, sent,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to accept approver role: %s", exc)
+            try:
+                await interaction.followup.send(
+                    "❌ 無法接受核准者角色，請稍後重試或聯繫系統管理員。",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    @app_commands.command(name="remove-approver", description="（測試用）移除自己的復原核准者身份")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def remove_approver(self, interaction: discord.Interaction) -> None:
+        """允許管理員移除自己的核准者身份（測試用途）。"""
+        try:
+            guild_id = str(interaction.guild_id)
+            user_id = str(interaction.user.id)
+            store = get_storage()
+
+            existing = await store.fetchone(
+                "SELECT 1 FROM recovery_approvers WHERE guild_id = ? AND user_id = ?",
+                [guild_id, user_id],
+            )
+
+            if existing:
+                await store.execute(
+                    "DELETE FROM recovery_approvers WHERE guild_id = ? AND user_id = ?",
+                    [guild_id, user_id],
+                )
+
+            if existing:
+                await interaction.response.send_message(
+                    "\u2705 已移除你的復原核准者身份。",
+                    ephemeral=True,
+                )
+                logger.info(
+                    "User %s removed approver role for guild %s via /remove-approver",
+                    user_id,
+                    guild_id,
+                )
+            else:
+                await interaction.response.send_message(
+                    "\u2139\ufe0f 你目前不是此伺服器的核准者，無需移除。",
+                    ephemeral=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to remove approver role: %s", exc)
+            await interaction.response.send_message(
+                "\u274c 移除失敗，請稍後重試或聯繫系統管理員。",
+                ephemeral=True,
+            )
 
     # ---------------------------------------------------------------- events
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        """Scan the guild, store a snapshot, and request admin approval."""
+        """掃描伺服器、保存初始快照，並發起管理員核准流程。"""
         logger.info("Joined guild '%s' (id=%s)", guild.name, guild.id)
         store = get_storage()
         guild_id = str(guild.id)
@@ -154,24 +392,16 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
 
         for admin in admins:
             await self._send_approval_dm(admin, guild)
+            await asyncio.sleep(DM_SEND_DELAY)
 
-    @commands.Cog.listener()
-    async def on_interaction(self, interaction: discord.Interaction) -> None:
-        """Fallback handler for button interactions (survives bot restarts)."""
-        if interaction.type != discord.InteractionType.component:
-            return
-        custom_id = interaction.data.get("custom_id", "")
-        if custom_id.startswith("accept_approver:"):
-            await self._handle_accept_approver(interaction, custom_id)
-        elif custom_id.startswith("retry_dm:"):
-            await self._handle_retry_dm(interaction, custom_id)
+
 
     # ------------------------------------------------------------- helpers
 
     async def _send_approval_dm(
         self, member: discord.Member, guild: discord.Guild
     ) -> None:
-        """Send a DM asking the admin to accept the recovery approver role."""
+        """發送邀請私訊，請管理員接受核准者角色。"""
         guild_id = str(guild.id)
 
         view = discord.ui.View(timeout=3600)  # 1 hour
@@ -203,17 +433,30 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
 
         try:
             await member.send(embed=embed, view=view)
-            logger.info("Sent approval DM to %s (guild=%s)", member, guild.name)
-        except discord.Forbidden:
+            logger.info("✓ Sent approval DM to %s (guild=%s)", member, guild.name)
+        except discord.Forbidden as e:
             logger.warning(
-                "Cannot DM %s — sending fallback in guild channel", member
+                "⚠ Cannot DM %s (Forbidden) — sending fallback in guild channel (guild=%s)",
+                member, guild.name
+            )
+            await self._send_fallback_channel_message(guild, member)
+        except discord.HTTPException as e:
+            logger.warning(
+                "⚠ Cannot DM %s (HTTPException: %s) — sending fallback (guild=%s)",
+                member, e, guild.name
+            )
+            await self._send_fallback_channel_message(guild, member)
+        except Exception as e:
+            logger.error(
+                "✗ Unexpected error sending DM to %s: %s (guild=%s)",
+                member, e, guild.name, exc_info=True
             )
             await self._send_fallback_channel_message(guild, member)
 
     async def _send_fallback_channel_message(
         self, guild: discord.Guild, member: discord.Member
     ) -> None:
-        """Send a fallback message in the guild when DM cannot be delivered."""
+        """當私訊失敗時，改在伺服器可發話頻道提示管理員。"""
         channel = guild.system_channel or next(
             (
                 ch
@@ -263,6 +506,7 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
     async def _handle_accept_approver(
         self, interaction: discord.Interaction, custom_id: str
     ) -> None:
+        """處理邀請按鈕：將使用者寫入 recovery_approvers。"""
         parts = custom_id.split(":")
         if len(parts) < 2:
             return
@@ -290,6 +534,7 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
     async def _handle_retry_dm(
         self, interaction: discord.Interaction, custom_id: str
     ) -> None:
+        """處理重送按鈕：重新嘗試發送核准邀請私訊。"""
         parts = custom_id.split(":")
         if len(parts) < 3:
             return
