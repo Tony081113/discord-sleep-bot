@@ -15,7 +15,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from mods.logger import setup_logger
-from mods.rate_limit import DM_SEND_DELAY
+from mods.rate_limit import dm_sleep
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
@@ -64,6 +64,7 @@ def _role_to_dict(role: discord.Role) -> dict:
         "color": role.color.value,
         "hoist": role.hoist,
         "mentionable": role.mentionable,
+        "members": [str(m.id) for m in role.members],
     }
 
 
@@ -423,7 +424,7 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
 
         for admin in admins:
             await self._send_approval_dm(admin, guild)
-            await asyncio.sleep(DM_SEND_DELAY)
+            await dm_sleep()
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:

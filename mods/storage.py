@@ -91,6 +91,7 @@ _RETRY_BACKOFF = 1.0          # seconds between D1 retry attempts
 _SYNC_KEY_PREFIX = "sync:"    # Redis keys with this prefix are synced to D1
 _D1_SYNC_TABLE = "redis_cache"
 _DEFAULT_SYNC_INTERVAL = 60   # seconds
+_RECOVERY_COMMIT_KEY_PREFIX = "sync:recovery:commit:"
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +615,7 @@ class DataStore:
         seen = 0
         batch: list[str] = []
         batch_size = 100
+        processed_commit_guilds: set[str] = set()
 
         async def _process_batch(keys_batch: list[str]) -> int:
             batch_synced = 0
@@ -622,6 +624,40 @@ class DataStore:
                     value = await self._redis.get(key)  # type: ignore[union-attr]
                     if value is None:
                         continue
+
+                    # Commit snapshots are staged in Redis first and then
+                    # persisted by the background sync task.
+                    if key.startswith(_RECOVERY_COMMIT_KEY_PREFIX):
+                        parts = key.split(":", 5)
+                        if len(parts) == 6:
+                            guild_id = parts[3]
+                            target_type = parts[4]
+                            target_id = parts[5]
+                            if target_type in {"guild", "channel", "role", "member"}:
+                                try:
+                                    # Validate snapshot payload is JSON before storing.
+                                    json.loads(value)
+                                    if guild_id not in processed_commit_guilds:
+                                        await self._d1_request(
+                                            "DELETE FROM structure_snapshots WHERE guild_id = ? AND pinned = 2",
+                                            [guild_id],
+                                        )
+                                        processed_commit_guilds.add(guild_id)
+                                    await self._d1_request(
+                                        """
+                                        INSERT INTO structure_snapshots
+                                            (guild_id, target_type, target_id, snapshot_data, timestamp, pinned)
+                                        VALUES (?, ?, ?, ?, (strftime('%s', 'now') - 301), 2)
+                                        """,
+                                        [guild_id, target_type, target_id, value],
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.error(
+                                        "Failed to persist recovery commit key '%s': %s",
+                                        key,
+                                        exc,
+                                    )
+
                     await self._d1_request(
                         f"""
                         INSERT INTO {_D1_SYNC_TABLE} (key, value, synced_at)

@@ -17,7 +17,7 @@ from discord.ext import commands
 
 from mods.crypto import decrypt
 from mods.logger import setup_logger
-from mods.rate_limit import rate_limited_call, CHANNEL_OP_DELAY, ROLE_OP_DELAY
+from mods.rate_limit import rate_limited_call, channel_sleep, role_sleep
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
@@ -445,22 +445,52 @@ class RecoveryCog(commands.Cog, name="Recovery"):
     ) -> list[dict[str, Any]]:
         """取得每個目標在攻擊前（至少 _RECOVERY_LOOKBACK 秒前）的最新快照。
 
+        若存在手動 commit 基準快照（pinned=2），優先使用該批基準。
         若不存在 5 分鐘前的資料，退回使用最早的快照（防止伺服器剛建立就遭攻擊）。
         """
+        baseline_rows = await store.fetchall(
+            """
+            WITH ranked AS (
+                SELECT target_id, snapshot_data, timestamp, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_id
+                           ORDER BY timestamp DESC, id DESC
+                       ) AS rn
+                FROM structure_snapshots
+                WHERE guild_id = ? AND target_type = ? AND pinned = 2
+            )
+            SELECT target_id, snapshot_data, timestamp
+            FROM ranked
+            WHERE rn = 1
+            """,
+            [guild_id, target_type],
+        )
+        if baseline_rows:
+            logger.info(
+                "Using commit baseline snapshots guild=%s type=%s count=%s",
+                guild_id,
+                target_type,
+                len(baseline_rows),
+            )
+            return baseline_rows
+
         rows = await store.fetchall(
             """
-            SELECT s1.target_id, s1.snapshot_data, s1.timestamp
-            FROM structure_snapshots s1
-            INNER JOIN (
-                SELECT target_id, MAX(timestamp) AS max_ts
+            WITH ranked AS (
+                SELECT target_id, snapshot_data, timestamp, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_id
+                           ORDER BY timestamp DESC, id DESC
+                       ) AS rn
                 FROM structure_snapshots
                 WHERE guild_id = ? AND target_type = ?
                   AND timestamp <= (strftime('%s', 'now') - ?)
-                GROUP BY target_id
-            ) s2 ON s1.target_id = s2.target_id AND s1.timestamp = s2.max_ts
-            WHERE s1.guild_id = ? AND s1.target_type = ?
+            )
+            SELECT target_id, snapshot_data, timestamp
+            FROM ranked
+            WHERE rn = 1
             """,
-            [guild_id, target_type, _RECOVERY_LOOKBACK, guild_id, target_type],
+            [guild_id, target_type, _RECOVERY_LOOKBACK],
         )
         if rows:
             return rows
@@ -471,17 +501,20 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         )
         return await store.fetchall(
             """
-            SELECT s1.target_id, s1.snapshot_data, s1.timestamp
-            FROM structure_snapshots s1
-            INNER JOIN (
-                SELECT target_id, MIN(timestamp) AS min_ts
+            WITH ranked AS (
+                SELECT target_id, snapshot_data, timestamp, id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_id
+                           ORDER BY timestamp ASC, id ASC
+                       ) AS rn
                 FROM structure_snapshots
                 WHERE guild_id = ? AND target_type = ?
-                GROUP BY target_id
-            ) s2 ON s1.target_id = s2.target_id AND s1.timestamp = s2.min_ts
-            WHERE s1.guild_id = ? AND s1.target_type = ?
+            )
+            SELECT target_id, snapshot_data, timestamp
+            FROM ranked
+            WHERE rn = 1
             """,
-            [guild_id, target_type, guild_id, target_type],
+            [guild_id, target_type],
         )
 
     async def _get_latest_guild_snapshot(
@@ -489,19 +522,31 @@ class RecoveryCog(commands.Cog, name="Recovery"):
     ) -> dict[str, Any] | None:
         """取得攻擊前最近的 guild 快照（名稱/縮圖/橫幅）。
 
+        若存在手動 commit 基準快照（pinned=2），優先使用該快照。
         若不存在 5 分鐘前的資料，退回使用最早的快照。
         """
         rows = await store.fetchall(
             """
             SELECT snapshot_data
             FROM structure_snapshots
-            WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
-              AND timestamp <= (strftime('%s', 'now') - ?)
-            ORDER BY timestamp DESC
+            WHERE guild_id = ? AND target_type = 'guild' AND target_id = ? AND pinned = 2
+            ORDER BY timestamp DESC, id DESC
             LIMIT 1
             """,
-            [guild_id, guild_id, _RECOVERY_LOOKBACK],
+            [guild_id, guild_id],
         )
+        if not rows:
+            rows = await store.fetchall(
+                """
+                SELECT snapshot_data
+                FROM structure_snapshots
+                WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
+                  AND timestamp <= (strftime('%s', 'now') - ?)
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                [guild_id, guild_id, _RECOVERY_LOOKBACK],
+            )
         if not rows:
             logger.warning(
                 "No pre-attack guild snapshot found guild=%s — falling back to earliest",
@@ -512,7 +557,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 SELECT snapshot_data
                 FROM structure_snapshots
                 WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
-                ORDER BY timestamp ASC
+                ORDER BY timestamp ASC, id ASC
                 LIMIT 1
                 """,
                 [guild_id, guild_id],
@@ -642,7 +687,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         data.get("name"),
                     )
                     await rate_limited_call(self._update_channel, guild, existing, data)
-                await asyncio.sleep(CHANNEL_OP_DELAY)
+                await channel_sleep(guild.id)
                 return 1
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -764,8 +809,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         snapshot_role_ids = {d["role_id"] for d in role_data_list}
 
         logger.info(
-            "Recovery snapshots loaded guild=%s request_id=%s channels=%s roles=%s",
-            guild_id, request_id, len(channel_data_list), len(role_data_list),
+            "Recovery snapshots loaded guild=%s request_id=%s channel_snapshots=%s role_snapshots=%s member_snapshots=%s",
+            guild_id, request_id, len(channel_data_list), len(role_data_list), len(member_data_list),
         )
 
         # ── Step 2: 刪除快照中不存在的多餘身分組、頻道 ─────────────────
@@ -869,7 +914,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     "Deleted extra channel guild=%s channel=%s name=%s",
                     guild.id, channel.id, channel.name,
                 )
-                await asyncio.sleep(CHANNEL_OP_DELAY)
+                await channel_sleep(guild.id)
             except discord.Forbidden:
                 logger.warning(
                     "Cannot delete extra channel (forbidden) guild=%s channel=%s",
@@ -897,7 +942,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     "Deleted extra thread guild=%s thread=%s name=%s",
                     guild.id, thread.id, thread.name,
                 )
-                await asyncio.sleep(CHANNEL_OP_DELAY)
+                await channel_sleep(guild.id)
             except discord.Forbidden:
                 logger.warning(
                     "Cannot delete extra thread (forbidden) guild=%s thread=%s",
@@ -939,7 +984,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     "Deleted extra role guild=%s role=%s name=%s",
                     guild.id, role.id, role.name,
                 )
-                await asyncio.sleep(ROLE_OP_DELAY)
+                await role_sleep(guild.id)
             except discord.Forbidden:
                 logger.warning(
                     "Cannot delete extra role (forbidden) guild=%s role=%s",
@@ -979,7 +1024,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     nick=target_nick,
                     reason="Recovery: restore nickname",
                 )
-                await asyncio.sleep(ROLE_OP_DELAY)
+                await role_sleep(guild.id)
             except discord.NotFound:
                 # 404: 使用者已離開或找不到，忽略。
                 return
@@ -1017,7 +1062,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     role,
                     reason="Recovery: restoring role membership",
                 )
-                await asyncio.sleep(ROLE_OP_DELAY)
+                await role_sleep(guild.id)
             except discord.Forbidden:
                 logger.warning(
                     "Cannot add role guild=%s role=%s member=%s",
@@ -1128,7 +1173,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         hoist=data["hoist"],
                         mentionable=data["mentionable"],
                     )
-                await asyncio.sleep(ROLE_OP_DELAY)
+                await role_sleep(guild.id)
                 return 1
             except Exception as exc:  # noqa: BLE001
                 logger.error(

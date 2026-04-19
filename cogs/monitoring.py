@@ -19,7 +19,7 @@ from discord.ext import commands
 from mods.crypto import encrypt
 from mods.defense import get_defense_state
 from mods.logger import setup_logger
-from mods.rate_limit import rate_limited_call, DM_SEND_DELAY
+from mods.rate_limit import rate_limited_call, dm_sleep
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
@@ -36,6 +36,7 @@ _BAN_OP_DELAY = 1.0  # seconds
 _ALERT_COOLDOWN_SECONDS = 120
 _SPAM_CLEANUP_LOOKBACK_SECONDS = 20
 _SPAM_CLEANUP_MAX_MESSAGES = 25
+_SELF_ACTION_LOOKBACK_SECONDS = 30
 
 _THRESHOLD: dict[str, int] = {
     "channel_delete": 3,
@@ -196,11 +197,35 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self, channel: discord.abc.GuildChannel
     ) -> None:
         """記錄頻道刪除事件，並檢查是否觸發異常警報。"""
+        if await self._is_bot_initiated_action(
+            channel.guild,
+            discord.AuditLogAction.channel_delete,
+            str(channel.id),
+        ):
+            logger.info(
+                "Skip self channel_delete event guild=%s channel=%s",
+                channel.guild.id,
+                channel.id,
+            )
+            return
+
         guild_id = str(channel.guild.id)
         store = get_storage()
+        ch_data = json.dumps(_channel_to_dict(channel), ensure_ascii=False)
+        # 存入 structure_snapshots，確保還原時能重建被刪除的頻道。
+        try:
+            await store.execute(
+                "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+                [guild_id, "channel", str(channel.id), ch_data],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to snapshot deleted channel guild=%s channel=%s: %s",
+                guild_id, channel.id, exc,
+            )
         await self._record_event(
             store, guild_id, "channel_delete", str(channel.id),
-            json.dumps(_channel_to_dict(channel), ensure_ascii=False), None,
+            ch_data, None,
         )
         await self._check_and_alert(store, channel.guild, "channel_delete")
 
@@ -211,6 +236,18 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         after: discord.abc.GuildChannel,
     ) -> None:
         """記錄頻道修改事件，更新快照與 channels 表。"""
+        if await self._is_bot_initiated_action(
+            after.guild,
+            discord.AuditLogAction.channel_update,
+            str(after.id),
+        ):
+            logger.info(
+                "Skip self channel_update event guild=%s channel=%s",
+                after.guild.id,
+                after.id,
+            )
+            return
+
         guild_id = str(after.guild.id)
         store = get_storage()
         old_data = json.dumps(_channel_to_dict(before), ensure_ascii=False)
@@ -248,6 +285,18 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role) -> None:
         """記錄身分組刪除事件，並檢查是否觸發異常警報。"""
+        if await self._is_bot_initiated_action(
+            role.guild,
+            discord.AuditLogAction.role_delete,
+            str(role.id),
+        ):
+            logger.info(
+                "Skip self role_delete event guild=%s role=%s",
+                role.guild.id,
+                role.id,
+            )
+            return
+
         guild_id = str(role.guild.id)
         store = get_storage()
         await self._record_event(
@@ -261,6 +310,18 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self, before: discord.Role, after: discord.Role
     ) -> None:
         """記錄身分組修改事件，並同步 roles 快照與資料表。"""
+        if await self._is_bot_initiated_action(
+            after.guild,
+            discord.AuditLogAction.role_update,
+            str(after.id),
+        ):
+            logger.info(
+                "Skip self role_update event guild=%s role=%s",
+                after.guild.id,
+                after.id,
+            )
+            return
+
         guild_id = str(after.guild.id)
         store = get_storage()
         old_data = json.dumps(_role_to_dict(before), ensure_ascii=False)
@@ -351,6 +412,14 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self, before: discord.Guild, after: discord.Guild
     ) -> None:
         """保存伺服器名稱/縮圖/橫幅快照供後續復原。"""
+        if await self._is_bot_initiated_action(
+            after,
+            discord.AuditLogAction.guild_update,
+            str(after.id),
+        ):
+            logger.info("Skip self guild_update event guild=%s", after.id)
+            return
+
         if (
             before.name == after.name
             and before.icon == after.icon
@@ -799,6 +868,33 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             )
         return attacker_ids
 
+    async def _is_bot_initiated_action(
+        self,
+        guild: discord.Guild,
+        action: discord.AuditLogAction,
+        target_id: str,
+    ) -> bool:
+        """檢查事件是否由本 bot 在近期稽核紀錄中觸發。"""
+        if not self.bot.user:
+            return False
+
+        cutoff = time.time() - _SELF_ACTION_LOOKBACK_SECONDS
+        try:
+            async for entry in guild.audit_logs(limit=20, action=action):
+                if entry.created_at.timestamp() < cutoff:
+                    break
+
+                entry_target_id = str(getattr(entry.target, "id", ""))
+                if entry_target_id and entry_target_id != target_id:
+                    continue
+
+                if entry.user and entry.user.id == self.bot.user.id:
+                    return True
+        except Exception:
+            return False
+
+        return False
+
     async def _pin_pre_attack_snapshots(
         self, store, guild_id: str
     ) -> None:
@@ -1196,7 +1292,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         event_type,
                         request_id,
                     )
-                    await asyncio.sleep(DM_SEND_DELAY)
+                    await dm_sleep()
                 sent += 1
             except discord.Forbidden:
                 logger.warning(

@@ -13,6 +13,7 @@ Responsibilities
 """
 
 import asyncio
+import json
 import os
 import pathlib
 
@@ -25,7 +26,7 @@ load_dotenv()
 
 from mods.logger import attach_redis, setup_logger, get_configured_logger_names
 from mods.schema import init_schema
-from mods.storage import init_storage, close_storage
+from mods.storage import init_storage, close_storage, get_storage
 
 logger = setup_logger(__name__)
 
@@ -80,6 +81,150 @@ async def cmd_reload(ctx: commands.Context, cog: str = "") -> None:
     if fail:
         lines += [f"\u274c {f}" for f in fail]
     await ctx.send("\n".join(lines) or "nothing to reload")
+
+
+@bot.command(name="commit")
+async def cmd_commit(ctx: commands.Context) -> None:
+    """Force-save current guild recovery snapshots (``>>commit``)."""
+    admin_id = os.getenv("BOT_ADMIN_ID", "").strip()
+    if not admin_id or str(ctx.author.id) != admin_id:
+        return
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("❌ 這個指令只能在伺服器內使用。")
+        return
+
+    store = get_storage()
+    if not store.redis_available:
+        await ctx.send(
+            "⚠️ commit skipped: Redis unavailable "
+            f"(redis={store.redis_available})"
+        )
+        return
+
+    guild_id = str(guild.id)
+    ch_count = ro_count = mb_count = 0
+
+    try:
+        guild_data = {
+            "guild_id": guild_id,
+            "name": guild.name,
+            "icon_url": str(guild.icon.url) if guild.icon else None,
+            "banner_url": str(guild.banner.url) if guild.banner else None,
+        }
+
+        redis = getattr(store, "_redis", None)
+        if redis is None:
+            await ctx.send("⚠️ commit skipped: Redis client unavailable")
+            return
+
+        redis_batch: list[str] = []
+        redis_prefix = f"sync:recovery:commit:{guild_id}"
+        redis_batch.append(f"{redis_prefix}:guild:{guild_id}")
+        redis_batch.append(json.dumps(guild_data, ensure_ascii=False))
+
+        channel_payloads: list[tuple[str, str]] = []
+        role_payloads: list[tuple[str, str]] = []
+        member_payloads: list[tuple[str, str]] = []
+
+        for channel in guild.channels:
+            ch_data = {
+                "channel_id": str(channel.id),
+                "name": channel.name,
+                "type": channel.type.value,
+                "position": channel.position,
+                "parent_id": str(channel.category_id) if channel.category_id else None,
+            }
+            overwrites = []
+            for target, overwrite in channel.overwrites.items():
+                allow, deny = overwrite.pair()
+                overwrites.append({
+                    "id": str(target.id),
+                    "type": "role" if isinstance(target, discord.Role) else "member",
+                    "allow": str(allow.value),
+                    "deny": str(deny.value),
+                })
+            ch_data["permission_overwrites"] = overwrites
+            if isinstance(channel, discord.TextChannel):
+                ch_data["topic"] = channel.topic
+                ch_data["nsfw"] = channel.nsfw
+                ch_data["slowmode_delay"] = channel.slowmode_delay
+
+            channel_payloads.append((
+                str(channel.id),
+                json.dumps(ch_data, ensure_ascii=False),
+            ))
+            redis_batch.append(f"{redis_prefix}:channel:{channel.id}")
+            redis_batch.append(channel_payloads[-1][1])
+            ch_count += 1
+
+        for role in guild.roles:
+            role_data = {
+                "role_id": str(role.id),
+                "name": role.name,
+                "permissions": str(role.permissions.value),
+                "position": role.position,
+                "color": role.color.value,
+                "hoist": role.hoist,
+                "mentionable": role.mentionable,
+                "members": [str(member.id) for member in role.members],
+            }
+            role_payloads.append((
+                str(role.id),
+                json.dumps(role_data, ensure_ascii=False),
+            ))
+            redis_batch.append(f"{redis_prefix}:role:{role.id}")
+            redis_batch.append(role_payloads[-1][1])
+            ro_count += 1
+
+        for member in guild.members:
+            member_data = {
+                "user_id": str(member.id),
+                "nick": member.nick,
+            }
+            member_payloads.append((
+                str(member.id),
+                json.dumps(member_data, ensure_ascii=False),
+            ))
+            redis_batch.append(f"{redis_prefix}:member:{member.id}")
+            redis_batch.append(member_payloads[-1][1])
+            mb_count += 1
+
+        chunk_size = 100
+        for i in range(0, len(redis_batch), chunk_size):
+            chunk = redis_batch[i : i + chunk_size]
+            pairs = {chunk[j]: chunk[j + 1] for j in range(0, len(chunk), 2)}
+            await redis.mset(pairs)
+        for i in range(0, len(redis_batch), 2):
+            await redis.expire(redis_batch[i], 3600)
+
+        total_snapshots = len(redis_batch) // 2
+
+        logger.info(
+            "Manual commit snapshot staged to Redis guild=%s channels=%d roles=%d members=%d user=%s",
+            guild_id,
+            ch_count,
+            ro_count,
+            mb_count,
+            ctx.author.id,
+        )
+        logger.info(
+            "Commit summary guild=%s snapshots_total=%d channels=%d roles=%d members=%d prefix=%s user=%s",
+            guild_id,
+            total_snapshots,
+            ch_count,
+            ro_count,
+            mb_count,
+            redis_prefix,
+            ctx.author.id,
+        )
+        await ctx.send(
+            f"✅ commit complete: 已寫入 Redis，後續由守護同步寫入（頻道 {ch_count}、身分組 {ro_count}、成員 {mb_count}）。"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Manual commit failed: %s", exc, exc_info=True)
+        await ctx.send(f"❌ commit failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

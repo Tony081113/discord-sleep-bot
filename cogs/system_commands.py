@@ -8,6 +8,7 @@
 """
 
 from time import perf_counter
+import json
 import os
 
 import discord
@@ -179,6 +180,88 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
             ),
             ephemeral=True,
         )
+
+    @app_commands.command(name="force-snapshot", description="立即重新快照伺服器頻道、身分組與成員暱稱")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def force_snapshot(self, interaction: discord.Interaction) -> None:
+        """強制更新此伺服器的結構快照（頻道、身分組、成員），以確保還原資料為最新狀態。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("❌ 此指令只能在伺服器內使用。", ephemeral=True)
+            return
+
+        store = get_storage()
+        guild_id = str(guild.id)
+        ch_count = ro_count = mb_count = 0
+
+        try:
+            for channel in guild.channels:
+                data = {
+                    "channel_id": str(channel.id),
+                    "name": channel.name,
+                    "type": channel.type.value,
+                    "position": channel.position,
+                    "parent_id": str(channel.category_id) if channel.category_id else None,
+                }
+                overwrites = []
+                for target, overwrite in channel.overwrites.items():
+                    allow, deny = overwrite.pair()
+                    overwrites.append({
+                        "id": str(target.id),
+                        "type": "role" if isinstance(target, discord.Role) else "member",
+                        "allow": str(allow.value),
+                        "deny": str(deny.value),
+                    })
+                data["permission_overwrites"] = overwrites
+                if isinstance(channel, discord.TextChannel):
+                    data["topic"] = channel.topic
+                    data["nsfw"] = channel.nsfw
+                    data["slowmode_delay"] = channel.slowmode_delay
+                await store.execute(
+                    "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+                    [guild_id, "channel", str(channel.id), json.dumps(data, ensure_ascii=False)],
+                )
+                ch_count += 1
+
+            for role in guild.roles:
+                data = {
+                    "role_id": str(role.id),
+                    "name": role.name,
+                    "permissions": str(role.permissions.value),
+                    "position": role.position,
+                    "color": role.color.value,
+                    "hoist": role.hoist,
+                    "mentionable": role.mentionable,
+                    "members": [str(m.id) for m in role.members],
+                }
+                await store.execute(
+                    "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+                    [guild_id, "role", str(role.id), json.dumps(data, ensure_ascii=False)],
+                )
+                ro_count += 1
+
+            for member in guild.members:
+                data = {"user_id": str(member.id), "nick": member.nick}
+                await store.execute(
+                    "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+                    [guild_id, "member", str(member.id), json.dumps(data, ensure_ascii=False)],
+                )
+                mb_count += 1
+
+            logger.info(
+                "Force snapshot completed guild=%s channels=%d roles=%d members=%d user=%s",
+                guild_id, ch_count, ro_count, mb_count, interaction.user.id,
+            )
+            await interaction.followup.send(
+                f"✅ 快照已更新：{ch_count} 個頻道、{ro_count} 個身分組、{mb_count} 位成員。",
+                ephemeral=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Force snapshot failed guild=%s: %s", guild_id, exc, exc_info=True)
+            await interaction.followup.send(f"❌ 快照失敗：{exc}", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
