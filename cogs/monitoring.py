@@ -139,12 +139,12 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self._message_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
         # 觸發冷卻：避免同一使用者在短時間內重複觸發。
         self._spam_triggered_at: dict[tuple[int, int], float] = {}
-        # 告警鎖：避免同 guild/event 並發重複建立請求與連發通知。
-        self._alert_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # 告警冷卻：避免短時間內重複發送同類異常通知。
-        self._last_alert_at: dict[tuple[str, str], float] = {}
-        # 已發送的告警訊息 ID：(guild_id, event_type, user_id) -> message_id，用於編輯而非重發。
-        self._last_alert_msg_ids: dict[tuple[str, str, str], int] = {}
+        # 告警鎖：避免同 guild 並發重複建立請求與連發通知。
+        self._alert_locks: dict[str, asyncio.Lock] = {}
+        # 告警冷卻：避免短時間內重複發送同伺服器異常通知。
+        self._last_alert_at: dict[str, float] = {}
+        # 已發送的告警訊息 ID：(guild_id, user_id) -> message_id，用於編輯而非重發。
+        self._last_alert_msg_ids: dict[tuple[str, str], int] = {}
 
     # ----------------------------------------------------------- on_message
 
@@ -190,6 +190,40 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         await self._detect_message_spam(message, store)
 
     # ------------------------------------------------------ channel events
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(
+        self, channel: discord.abc.GuildChannel
+    ) -> None:
+        """記錄新建頻道事件，確保新建類別/頻道也有可還原快照。"""
+        guild_id = str(channel.guild.id)
+        store = get_storage()
+        new_data = json.dumps(_channel_to_dict(channel), ensure_ascii=False)
+
+        await self._record_event(
+            store, guild_id, "channel_create", str(channel.id), None, new_data,
+        )
+
+        await store.execute(
+            "INSERT INTO structure_snapshots "
+            "(guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+            [guild_id, "channel", str(channel.id), new_data],
+        )
+
+        await store.execute(
+            """
+            INSERT INTO channels (channel_id, guild_id, name, type, position, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                name = excluded.name, type = excluded.type,
+                position = excluded.position, parent_id = excluded.parent_id
+            """,
+            [
+                str(channel.id), guild_id, channel.name,
+                channel.type.value, channel.position,
+                str(channel.category_id) if channel.category_id else None,
+            ],
+        )
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(
@@ -244,6 +278,40 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
 
     # --------------------------------------------------------- role events
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role) -> None:
+        """記錄新建身分組事件，確保新建角色也有可還原快照。"""
+        guild_id = str(role.guild.id)
+        store = get_storage()
+        new_data = json.dumps(_role_to_dict(role), ensure_ascii=False)
+
+        await self._record_event(
+            store, guild_id, "role_create", str(role.id), None, new_data,
+        )
+
+        await store.execute(
+            "INSERT INTO structure_snapshots "
+            "(guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+            [guild_id, "role", str(role.id), new_data],
+        )
+
+        await store.execute(
+            """
+            INSERT INTO roles
+                (role_id, guild_id, name, permissions, position, color, hoist, mentionable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(role_id) DO UPDATE SET
+                name = excluded.name, permissions = excluded.permissions,
+                position = excluded.position, color = excluded.color,
+                hoist = excluded.hoist, mentionable = excluded.mentionable
+            """,
+            [
+                str(role.id), guild_id, role.name,
+                str(role.permissions.value), role.position,
+                role.color.value, int(role.hoist), int(role.mentionable),
+            ],
+        )
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role) -> None:
@@ -902,6 +970,39 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
         return threshold
 
+    async def _get_recent_event_summary(
+        self, store, guild_id: str
+    ) -> dict[str, int]:
+        """彙總近 _ANOMALY_WINDOW 秒內各異常事件數量。"""
+        try:
+            rows = await store.fetchall(
+                """
+                SELECT event_type, COUNT(*) AS cnt
+                FROM temp_cache
+                WHERE guild_id = ?
+                  AND timestamp >= (strftime('%s', 'now') - ?)
+                GROUP BY event_type
+                """,
+                [guild_id, _ANOMALY_WINDOW],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to build event summary guild=%s: %s",
+                guild_id,
+                exc,
+                exc_info=True,
+            )
+            return {}
+
+        summary: dict[str, int] = {}
+        for row in rows:
+            ev = row.get("event_type")
+            cnt = int(row.get("cnt") or 0)
+            if not ev or cnt <= 0:
+                continue
+            summary[str(ev)] = cnt
+        return summary
+
     async def _check_and_alert(
         self, store, guild: discord.Guild, event_type: str
     ) -> None:
@@ -928,7 +1029,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             _ANOMALY_WINDOW,
         )
 
-        lock_key = (guild_id, event_type)
+        lock_key = guild_id
         lock = self._alert_locks.get(lock_key)
         if lock is None:
             lock = asyncio.Lock()
@@ -990,22 +1091,30 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 )
                 return
 
-            # 若尚無待處理請求，建立新的 recovery request。
+            # 每個伺服器同時間只允許一筆 pending 請求，避免不同事件類型重複告警。
             request_id = None
             try:
                 existing = await store.fetchall(
                     "SELECT id FROM recovery_requests "
-                    "WHERE guild_id = ? AND event_type = ? AND status = 'pending'",
-                    [guild_id, event_type],
+                    "WHERE guild_id = ? AND status = 'pending' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [guild_id],
                 )
                 if existing:
+                    pending_id = existing[0]["id"]
+                    await store.execute(
+                        "UPDATE recovery_requests "
+                        "SET event_count = CASE WHEN event_count > ? THEN event_count ELSE ? END "
+                        "WHERE id = ? AND guild_id = ?",
+                        [count, count, pending_id, guild_id],
+                    )
                     logger.info(
                         "Pending recovery request already exists guild=%s event=%s request_id=%s",
                         guild_id,
                         event_type,
-                        existing[0]["id"],
+                        pending_id,
                     )
-                    return  # 同類異常已有待處理請求，避免重複通知。
+                    return
                 await store.execute(
                     "INSERT INTO recovery_requests (guild_id, event_type, event_count) "
                     "VALUES (?, ?, ?)",
@@ -1013,9 +1122,9 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 )
                 row = await store.fetchall(
                     "SELECT id FROM recovery_requests "
-                    "WHERE guild_id = ? AND event_type = ? AND status = 'pending' "
+                    "WHERE guild_id = ? AND status = 'pending' "
                     "ORDER BY created_at DESC LIMIT 1",
-                    [guild_id, event_type],
+                    [guild_id],
                 )
                 if row:
                     request_id = row[0]["id"]
@@ -1069,11 +1178,20 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             # 釘住攻擊前快照，防止守護程式擠掉可還原資料。
             await self._pin_pre_attack_snapshots(store, guild_id)
 
-            await self._alert_approvers(store, guild, event_type, count, request_id)
+            event_summary = await self._get_recent_event_summary(store, guild_id)
+            await self._alert_approvers(
+                store,
+                guild,
+                event_type,
+                count,
+                request_id,
+                event_summary,
+            )
 
     async def _alert_approvers(
         self, store, guild: discord.Guild, event_type: str, count: int,
         request_id: int | None = None,
+        event_summary: dict[str, int] | None = None,
     ) -> None:
         """將異常警報透過私訊發給核准者，附上一鍵復原按鈕。"""
         guild_id = str(guild.id)
@@ -1112,12 +1230,20 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
 
         label = _EVENT_LABELS.get(event_type, event_type)
+        summary = event_summary or {}
+        summary_lines: list[str] = []
+        for ev, ev_count in sorted(summary.items(), key=lambda item: item[1], reverse=True):
+            ev_label = _EVENT_LABELS.get(ev, ev)
+            summary_lines.append(f"- {ev_label}: {ev_count}")
+        summary_text = "\n".join(summary_lines) if summary_lines else "- 無可用摘要"
+
         embed = discord.Embed(
             title="\U0001f6a8 伺服器異常警報",
             description=(
                 f"**{guild.name}** 偵測到異常活動：\n\n"
                 f"\U0001f4cb 類型：**{label}**\n"
                 f"\U0001f4ca 5 分鐘內事件數：**{count}**\n\n"
+                f"\U0001f4dd 伺服器異常摘要（5 分鐘）：\n{summary_text}\n\n"
                 f"如需將伺服器復原至 5 分鐘前的狀態，請點擊下方按鈕。"
             ),
             color=discord.Color.red(),
@@ -1169,7 +1295,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     )
                     continue
             try:
-                msg_key = (guild_id, event_type, user_id)
+                msg_key = (guild_id, user_id)
                 prev_msg_id = self._last_alert_msg_ids.get(msg_key)
                 edited = False
                 if prev_msg_id:

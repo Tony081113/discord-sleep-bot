@@ -19,6 +19,32 @@ def _normalize_duration(duration_seconds: int) -> int:
     return max(MIN_DISABLE_SECONDS, min(MAX_DISABLE_SECONDS, duration_seconds))
 
 
+def _to_bool(value: Any, default: bool = True) -> bool:
+    """將資料庫值安全轉為布林，避免字串 '0' 被誤判為 True。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    """將資料庫值安全轉為 int；無法解析則回傳 None。"""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def get_defense_state(store, guild_id: str) -> dict[str, Any]:
     """取得防禦狀態；若逾時則自動恢復並回傳最新狀態。"""
     rows = await store.fetchall(
@@ -35,12 +61,11 @@ async def get_defense_state(store, guild_id: str) -> dict[str, Any]:
         }
 
     row = rows[0]
-    enabled = bool(row.get("is_enabled", 1))
-    disabled_until = row.get("disabled_until")
+    enabled = _to_bool(row.get("is_enabled", 1), default=True)
+    disabled_until = _to_int_or_none(row.get("disabled_until"))
     now = int(time.time())
 
-    if not enabled and disabled_until:
-        disabled_until = int(disabled_until)
+    if not enabled and disabled_until is not None:
         if now >= disabled_until:
             await store.execute(
                 "UPDATE guild_defense_state "
@@ -62,6 +87,26 @@ async def get_defense_state(store, guild_id: str) -> dict[str, Any]:
             "disabled_until": disabled_until,
             "remaining_seconds": max(0, disabled_until - now),
             "auto_restored": False,
+        }
+
+    if not enabled and disabled_until is None:
+        # 舊資料或異常資料可能缺少 disabled_until，避免永久停用造成防禦失靈。
+        await store.execute(
+            "UPDATE guild_defense_state "
+            "SET is_enabled = 1, disabled_until = NULL, updated_by = ?, "
+            "updated_at = strftime('%s','now') "
+            "WHERE guild_id = ?",
+            ["system:auto_restore_invalid_state", guild_id],
+        )
+        logger.warning(
+            "Defense state had no disabled_until while disabled; auto-restored guild=%s",
+            guild_id,
+        )
+        return {
+            "enabled": True,
+            "disabled_until": None,
+            "remaining_seconds": 0,
+            "auto_restored": True,
         }
 
     return {

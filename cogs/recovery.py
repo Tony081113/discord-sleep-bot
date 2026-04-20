@@ -613,6 +613,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         """依快照重建或修正頻道設定。接受已解析的快照 dict 清單。"""
         restored = 0
         current = {str(ch.id): ch for ch in guild.channels}
+        used_channel_ids: set[str] = set()
+        category_id_map: dict[str, str] = {}
 
         logger.info(
             "Restoring channels guild=%s snapshots=%s current_channels=%s",
@@ -621,9 +623,33 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             len(current),
         )
 
+        def _pick_fallback_channel(data: dict):
+            """當快照 ID 已失效時，盡量重用現有同型同名頻道避免重建重複。"""
+            ch_type = data.get("type")
+            target_name = data.get("name")
+            if target_name is None:
+                return None
+
+            for ch in guild.channels:
+                ch_id = str(ch.id)
+                if ch_id in used_channel_ids:
+                    continue
+                if ch.type.value != ch_type:
+                    continue
+                if ch.name != target_name:
+                    continue
+                return ch
+            return None
+
         async def _restore_one_channel(data: dict) -> int:
             channel_id = data["channel_id"]
             existing = current.get(channel_id)
+            if existing is None:
+                existing = _pick_fallback_channel(data)
+            if existing is not None:
+                used_channel_ids.add(str(existing.id))
+                if data.get("type") == discord.ChannelType.category.value:
+                    category_id_map[channel_id] = str(existing.id)
 
             try:
                 if existing is None:
@@ -633,7 +659,17 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         channel_id,
                         data.get("name"),
                     )
-                    await rate_limited_call(self._recreate_channel, guild, data)
+                    created = await rate_limited_call(
+                        self._recreate_channel,
+                        guild,
+                        data,
+                        category_id_map,
+                    )
+                    if (
+                        created is not None
+                        and data.get("type") == discord.ChannelType.category.value
+                    ):
+                        category_id_map[channel_id] = str(created.id)
                 else:
                     logger.info(
                         "Updating existing channel guild=%s channel_id=%s name=%s",
@@ -641,7 +677,13 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                         channel_id,
                         data.get("name"),
                     )
-                    await rate_limited_call(self._update_channel, guild, existing, data)
+                    await rate_limited_call(
+                        self._update_channel,
+                        guild,
+                        existing,
+                        data,
+                        category_id_map,
+                    )
                 await asyncio.sleep(CHANNEL_OP_DELAY)
                 return 1
             except Exception as exc:  # noqa: BLE001
@@ -655,24 +697,52 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 )
                 return 0
 
-        results = await self._gather_bounded(
-            [_restore_one_channel(data) for data in channel_data_list],
+        # 兩階段還原：先完整還原類別，再還原子頻道，避免 parent 尚未建立。
+        category_data = [
+            d for d in channel_data_list
+            if d.get("type") == discord.ChannelType.category.value
+        ]
+        other_data = [
+            d for d in channel_data_list
+            if d.get("type") != discord.ChannelType.category.value
+        ]
+
+        category_results = await self._gather_bounded(
+            [_restore_one_channel(data) for data in sorted(category_data, key=lambda d: d.get("position", 0))],
             _CHANNEL_RESTORE_CONCURRENCY,
         )
-        restored = sum(results)
+
+        # 類別可能剛被建立，重抓一次 current 提供下一階段 parent 查找。
+        current = {str(ch.id): ch for ch in guild.channels}
+
+        other_results = await self._gather_bounded(
+            [_restore_one_channel(data) for data in sorted(other_data, key=lambda d: d.get("position", 0))],
+            _CHANNEL_RESTORE_CONCURRENCY,
+        )
+
+        restored = sum(category_results) + sum(other_results)
         return restored
 
     async def _recreate_channel(
-        self, guild: discord.Guild, data: dict
-    ) -> None:
+        self,
+        guild: discord.Guild,
+        data: dict,
+        category_id_map: dict[str, str] | None = None,
+    ):
         """依快照資料重建單一頻道。"""
+        category_id_map = category_id_map or {}
+
+        def _resolve_category(parent_id: str | None):
+            if not parent_id:
+                return None
+            mapped_parent_id = category_id_map.get(parent_id, parent_id)
+            return guild.get_channel(int(mapped_parent_id))
+
         ch_type = discord.ChannelType(data["type"])
         overwrites = self._build_overwrites(
             guild, data.get("permission_overwrites", [])
         )
-        category = None
-        if data.get("parent_id"):
-            category = guild.get_channel(int(data["parent_id"]))
+        category = _resolve_category(data.get("parent_id"))
 
         kwargs: dict[str, Any] = {
             "name": data["name"],
@@ -686,20 +756,33 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             kwargs["topic"] = data.get("topic")
             kwargs["nsfw"] = data.get("nsfw", False)
             kwargs["slowmode_delay"] = data.get("slowmode_delay", 0)
-            await guild.create_text_channel(**kwargs)
+            created = await guild.create_text_channel(**kwargs)
         elif ch_type == discord.ChannelType.voice:
-            await guild.create_voice_channel(**kwargs)
+            created = await guild.create_voice_channel(**kwargs)
         elif ch_type == discord.ChannelType.category:
-            await guild.create_category(**kwargs)
+            created = await guild.create_category(**kwargs)
         else:
-            await guild.create_text_channel(**kwargs)
+            created = await guild.create_text_channel(**kwargs)
 
         logger.info("Recreated channel '%s' in guild %s", data["name"], guild.id)
+        return created
 
     async def _update_channel(
-        self, guild: discord.Guild, channel, data: dict
+        self,
+        guild: discord.Guild,
+        channel,
+        data: dict,
+        category_id_map: dict[str, str] | None = None,
     ) -> None:
         """將既有頻道調整回快照設定。"""
+        category_id_map = category_id_map or {}
+
+        def _resolve_category(parent_id: str | None):
+            if not parent_id:
+                return None
+            mapped_parent_id = category_id_map.get(parent_id, parent_id)
+            return guild.get_channel(int(mapped_parent_id))
+
         overwrites = self._build_overwrites(
             guild, data.get("permission_overwrites", [])
         )
@@ -708,6 +791,9 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             "position": data.get("position", 0),
             "overwrites": overwrites,
         }
+        if not isinstance(channel, discord.CategoryChannel):
+            parent_id = data.get("parent_id")
+            edit_kwargs["category"] = _resolve_category(parent_id)
         if isinstance(channel, discord.TextChannel):
             edit_kwargs["topic"] = data.get("topic")
             edit_kwargs["nsfw"] = data.get("nsfw", False)
