@@ -14,6 +14,10 @@ MIN_DISABLE_SECONDS = 60
 MAX_DISABLE_SECONDS = 86400
 
 
+class DefenseStorageError(RuntimeError):
+    """Raised when defense state cannot be persisted to storage."""
+
+
 def _normalize_duration(duration_seconds: int) -> int:
     """將停用秒數限制在安全範圍。"""
     return max(MIN_DISABLE_SECONDS, min(MAX_DISABLE_SECONDS, duration_seconds))
@@ -47,10 +51,25 @@ def _to_int_or_none(value: Any) -> int | None:
 
 async def get_defense_state(store, guild_id: str) -> dict[str, Any]:
     """取得防禦狀態；若逾時則自動恢復並回傳最新狀態。"""
-    rows = await store.fetchall(
-        "SELECT is_enabled, disabled_until FROM guild_defense_state WHERE guild_id = ?",
-        [guild_id],
-    )
+    try:
+        rows = await store.fetchall(
+            "SELECT is_enabled, disabled_until FROM guild_defense_state WHERE guild_id = ?",
+            [guild_id],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to read defense state guild=%s: %s",
+            guild_id,
+            exc,
+            exc_info=True,
+        )
+        # Fail-safe: keep defense enabled if state backend is unavailable.
+        return {
+            "enabled": True,
+            "disabled_until": None,
+            "remaining_seconds": 0,
+            "auto_restored": False,
+        }
 
     if not rows:
         return {
@@ -127,14 +146,24 @@ async def set_defense_disabled(
     duration = _normalize_duration(duration_seconds)
     disabled_until = int(time.time()) + duration
 
-    await store.execute(
-        "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
-        "VALUES (?, 0, ?, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET "
-        "is_enabled = 0, disabled_until = excluded.disabled_until, "
-        "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
-        [guild_id, disabled_until, updated_by],
-    )
+    try:
+        await store.execute(
+            "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
+            "VALUES (?, 0, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "is_enabled = 0, disabled_until = excluded.disabled_until, "
+            "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
+            [guild_id, disabled_until, updated_by],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to disable defense guild=%s by=%s: %s",
+            guild_id,
+            updated_by,
+            exc,
+            exc_info=True,
+        )
+        raise DefenseStorageError("failed to disable defense") from exc
 
     logger.warning(
         "Defense disabled guild=%s by=%s until=%s duration=%s",
@@ -153,14 +182,24 @@ async def set_defense_disabled(
 
 async def set_defense_enabled(store, guild_id: str, updated_by: str) -> dict[str, Any]:
     """立即啟用防禦系統。"""
-    await store.execute(
-        "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
-        "VALUES (?, 1, NULL, ?) "
-        "ON CONFLICT(guild_id) DO UPDATE SET "
-        "is_enabled = 1, disabled_until = NULL, "
-        "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
-        [guild_id, updated_by],
-    )
+    try:
+        await store.execute(
+            "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
+            "VALUES (?, 1, NULL, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "is_enabled = 1, disabled_until = NULL, "
+            "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
+            [guild_id, updated_by],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to enable defense guild=%s by=%s: %s",
+            guild_id,
+            updated_by,
+            exc,
+            exc_info=True,
+        )
+        raise DefenseStorageError("failed to enable defense") from exc
 
     logger.info("Defense enabled guild=%s by=%s", guild_id, updated_by)
     return {

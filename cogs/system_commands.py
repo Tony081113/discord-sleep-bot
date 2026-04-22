@@ -15,6 +15,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from mods.defense import (
+    DefenseStorageError,
     DEFAULT_DISABLE_SECONDS,
     get_defense_state,
     set_defense_disabled,
@@ -140,45 +141,71 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
         guild_id = str(guild.id)
         user_id = str(interaction.user.id)
 
-        if action.value == "disable":
-            state = await set_defense_disabled(
-                store,
-                guild_id,
-                user_id,
-                duration_seconds=DEFAULT_DISABLE_SECONDS,
-            )
+        try:
+            if action.value == "disable":
+                state = await set_defense_disabled(
+                    store,
+                    guild_id,
+                    user_id,
+                    duration_seconds=DEFAULT_DISABLE_SECONDS,
+                )
+                until = state["disabled_until"]
+                await interaction.followup.send(
+                    (
+                        "🛑 防禦系統已暫時關閉。\n"
+                        f"將於 <t:{until}:R> 自動恢復（<t:{until}:f>）。\n"
+                        "你也可以隨時用 `/defense` 選擇「立即啟用」。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if action.value == "enable":
+                await set_defense_enabled(store, guild_id, user_id)
+                await interaction.followup.send(
+                    "✅ 防禦系統已重新啟用。",
+                    ephemeral=True,
+                )
+                return
+
+            state = await get_defense_state(store, guild_id)
+            if state["enabled"]:
+                await interaction.followup.send("✅ 目前防禦系統為啟用中。", ephemeral=True)
+                return
+
             until = state["disabled_until"]
             await interaction.followup.send(
                 (
-                    "🛑 防禦系統已暫時關閉。\n"
-                    f"將於 <t:{until}:R> 自動恢復（<t:{until}:f>）。\n"
-                    "你也可以隨時用 `/defense` 選擇「立即啟用」。"
+                    "🛑 目前防禦系統為暫停中。\n"
+                    f"預計 <t:{until}:R> 自動恢復（<t:{until}:f>）。"
                 ),
                 ephemeral=True,
             )
-            return
-
-        if action.value == "enable":
-            await set_defense_enabled(store, guild_id, user_id)
+        except DefenseStorageError:
+            logger.warning(
+                "Defense command storage failed guild=%s action=%s user=%s",
+                guild_id,
+                action.value,
+                user_id,
+                exc_info=True,
+            )
             await interaction.followup.send(
-                "✅ 防禦系統已重新啟用。",
+                "❌ 防禦操作失敗：儲存服務暫時不可用，請稍後再試。",
                 ephemeral=True,
             )
-            return
-
-        state = await get_defense_state(store, guild_id)
-        if state["enabled"]:
-            await interaction.followup.send("✅ 目前防禦系統為啟用中。", ephemeral=True)
-            return
-
-        until = state["disabled_until"]
-        await interaction.followup.send(
-            (
-                "🛑 目前防禦系統為暫停中。\n"
-                f"預計 <t:{until}:R> 自動恢復（<t:{until}:f>）。"
-            ),
-            ephemeral=True,
-        )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Defense command failed guild=%s action=%s user=%s: %s",
+                guild_id,
+                action.value,
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            await interaction.followup.send(
+                "❌ 防禦操作失敗，請稍後重試。",
+                ephemeral=True,
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

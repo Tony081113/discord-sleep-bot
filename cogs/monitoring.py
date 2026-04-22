@@ -35,8 +35,8 @@ _MESSAGE_SPAM_COOLDOWN = 60  # seconds
 _BAN_OP_DELAY = 1.0  # seconds
 _ALERT_COOLDOWN_SECONDS = 120
 _ATTACKER_NEUTRALIZE_COOLDOWN_SECONDS = 90
-_SPAM_CLEANUP_LOOKBACK_SECONDS = 20
-_SPAM_CLEANUP_MAX_MESSAGES = 25
+_SPAM_CLEANUP_LOOKBACK_SECONDS = 60
+_SPAM_CLEANUP_MAX_MESSAGES = 200
 
 _THRESHOLD: dict[str, int] = {
     "channel_create": 8,
@@ -737,27 +737,40 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             owners,
         )
 
+        # 立即在背景啟動釘快照 + 復原警報任務，不等待封鎖流程結束。
+        asyncio.create_task(
+            self._pin_and_alert_spam(store, guild),
+            name=f"spam_alert_{guild.id}",
+        )
+
         # 若 JSON 含 authorizing_integration_owners，視為 User Install 路徑：
-        # 先封 owner，再刪訊息；不要嘗試封鎖發訊者。
+        # 封 owner 與刪訊息並行。
         if owners:
-            await self._ban_authorizing_owner_ids(guild, owners, str(message.id))
-            await self._delete_detected_spam_message(message, source_kind="user_install")
-            await self._delete_recent_spam_messages(
-                message,
-                source_kind="user_install",
+            await asyncio.gather(
+                self._ban_authorizing_owner_ids(guild, owners, str(message.id)),
+                self._delete_recent_spam_messages(message, source_kind="user_install"),
             )
+            await self._delete_detected_spam_message(message, source_kind="user_install")
         elif message.webhook_id is not None:
             webhook_actor_ids = await self._find_webhook_operator_ids_from_audit(
                 guild,
                 str(message.webhook_id),
             )
+            # 無論是否找到操作者，立即在背景刪除 webhook 本身以阻斷來源。
+            asyncio.create_task(
+                self._delete_spam_webhook(guild, str(message.webhook_id)),
+                name=f"del_webhook_{message.webhook_id}",
+            )
+            ban_coros: list = [
+                self._delete_recent_spam_messages(message, source_kind="webhook_message"),
+            ]
             if webhook_actor_ids:
-                await self._ban_user_ids(
+                ban_coros.append(self._ban_user_ids(
                     guild=guild,
                     user_ids=webhook_actor_ids,
                     source_message_id=str(message.id),
                     source_kind="webhook_message_audit",
-                )
+                ))
             else:
                 logger.warning(
                     "Webhook spam found but no executor from audit guild=%s webhook_id=%s message=%s",
@@ -765,28 +778,61 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     message.webhook_id,
                     message.id,
                 )
+            await asyncio.gather(*ban_coros)
             await self._delete_detected_spam_message(message, source_kind="webhook_message")
-            await self._delete_recent_spam_messages(
-                message,
-                source_kind="webhook_message",
-            )
         else:
-            # 無 owner 資訊時，退回封鎖發訊者，再刪訊息。
-            await self._ban_user_ids(
-                guild=guild,
-                user_ids={message.author.id},
-                source_message_id=str(message.id),
-                source_kind="message_author_fallback",
+            # 無 owner 資訊時，封鎖發訊者與刪訊息並行。
+            await asyncio.gather(
+                self._ban_user_ids(
+                    guild=guild,
+                    user_ids={message.author.id},
+                    source_message_id=str(message.id),
+                    source_kind="message_author_fallback",
+                ),
+                self._delete_recent_spam_messages(message, source_kind="message_author"),
             )
             await self._delete_detected_spam_message(message, source_kind="message_author")
-            await self._delete_recent_spam_messages(
-                message,
-                source_kind="message_author",
+
+    async def _pin_and_alert_spam(self, store, guild: discord.Guild) -> None:
+        """背景任務：釘住攻擊前快照並發送復原警報。"""
+        try:
+            await self._pin_pre_attack_snapshots(store, str(guild.id))
+            await self._check_and_alert(store, guild, "message_spam")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "pin_and_alert_spam failed guild=%s: %s", guild.id, exc, exc_info=True
             )
 
-        # 釘住快照並建立復原請求（與其他事件類型統一流程）。
-        await self._pin_pre_attack_snapshots(store, str(guild.id))
-        await self._check_and_alert(store, guild, "message_spam")
+    async def _delete_spam_webhook(self, guild: discord.Guild, webhook_id: str) -> None:
+        """背景任務：刪除垃圾 webhook，阻斷訊息來源。"""
+        try:
+            webhook = await rate_limited_call(
+                guild.fetch_webhook,
+                int(webhook_id),
+                limit_key="webhook_fetch",
+            )
+            await rate_limited_call(
+                webhook.delete,
+                reason="Spam webhook — deleted by defense system",
+                limit_key="webhook_ops",
+            )
+            logger.warning(
+                "Deleted spam webhook guild=%s webhook_id=%s", guild.id, webhook_id
+            )
+        except discord.NotFound:
+            logger.info(
+                "Spam webhook already gone guild=%s webhook_id=%s", guild.id, webhook_id
+            )
+        except discord.Forbidden:
+            logger.error(
+                "Cannot delete webhook guild=%s webhook_id=%s (no permission)",
+                guild.id, webhook_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to delete webhook guild=%s webhook_id=%s: %s",
+                guild.id, webhook_id, exc, exc_info=True,
+            )
 
     async def _find_webhook_operator_ids_from_audit(
         self,
@@ -880,7 +926,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         message: discord.Message,
         source_kind: str,
     ) -> None:
-        """刪除同一波 recent spam 訊息（同頻道、同作者）。"""
+        """刪除同一波 recent spam 訊息（channel.purge 批次刪除）。"""
         channel = message.channel
         if not isinstance(channel, discord.TextChannel):
             return
@@ -888,55 +934,49 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         cutoff = discord.utils.utcnow() - datetime.timedelta(
             seconds=_SPAM_CLEANUP_LOOKBACK_SECONDS
         )
-        deleted = 0
+        author_id = message.author.id
+        webhook_id = message.webhook_id
+
+        def _is_spam(m: discord.Message) -> bool:
+            if m.id == message.id:
+                return False
+            if webhook_id is not None and m.webhook_id == webhook_id:
+                return True
+            return m.author.id == author_id
 
         try:
-            async for item in channel.history(limit=100, after=cutoff):
-                if deleted >= _SPAM_CLEANUP_MAX_MESSAGES:
-                    break
-                if item.id == message.id:
-                    continue
-                if item.author.id != message.author.id:
-                    continue
-                try:
-                    await rate_limited_call(
-                        item.delete,
-                        reason=f"Recent spam cleanup ({source_kind})",
-                    )
-                    deleted += 1
-                    await asyncio.sleep(0.25)
-                except discord.NotFound:
-                    continue
-                except discord.Forbidden:
-                    logger.error(
-                        "Recent spam cleanup forbidden channel=%s source=%s",
-                        channel.id,
-                        source_kind,
-                    )
-                    break
-                except discord.HTTPException as exc:
-                    logger.warning(
-                        "Recent spam cleanup failed channel=%s msg=%s source=%s: %s",
-                        channel.id,
-                        item.id,
-                        source_kind,
-                        exc,
-                    )
+            deleted = await channel.purge(
+                limit=_SPAM_CLEANUP_MAX_MESSAGES,
+                check=_is_spam,
+                after=cutoff,
+                reason=f"Spam cleanup ({source_kind})",
+                bulk=True,
+            )
             if deleted:
                 logger.warning(
-                    "Recent spam cleanup done guild=%s channel=%s deleted=%s source=%s",
-                    message.guild.id if message.guild else "unknown",
+                    "Spam cleanup deleted=%s channel=%s guild=%s source=%s",
+                    len(deleted),
                     channel.id,
-                    deleted,
+                    message.guild.id if message.guild else "unknown",
                     source_kind,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except discord.Forbidden:
             logger.error(
-                "Recent spam cleanup crashed channel=%s source=%s: %s",
+                "Spam cleanup forbidden channel=%s source=%s",
+                channel.id,
+                source_kind,
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Spam cleanup failed channel=%s source=%s: %s",
                 channel.id,
                 source_kind,
                 exc,
-                exc_info=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Spam cleanup crashed channel=%s source=%s: %s",
+                channel.id, source_kind, exc, exc_info=True,
             )
 
     async def _ban_authorizing_owner_ids(
@@ -987,7 +1027,11 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     continue
 
                 # 僅處理可解析為 Discord 使用者的 ID。
-                await rate_limited_call(self.bot.fetch_user, user_id)
+                await rate_limited_call(
+                    self.bot.fetch_user,
+                    user_id,
+                    limit_key="user_fetch",
+                )
 
                 member = guild.get_member(user_id)
                 if member:
@@ -998,6 +1042,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                             member.edit,
                             roles=safe_roles,
                             reason=f"Attack detected — stripping roles ({source_kind})",
+                            limit_key="member_ops",
                         )
                         logger.info(
                             "Stripped roles guild=%s user=%s source=%s",
@@ -1010,11 +1055,16 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         )
                     # 2. 靜音（timeout 最長 28 天）
                     try:
-                        until = discord.utils.utcnow() + datetime.timedelta(days=28)
+                        # Discord 對 timeout 時間戳很嚴格：採保守值並去除微秒。
+                        until = (
+                            datetime.datetime.now(datetime.timezone.utc)
+                            + datetime.timedelta(days=27, hours=23, minutes=50)
+                        ).replace(microsecond=0)
                         await rate_limited_call(
                             member.edit,
                             timed_out_until=until,
                             reason=f"Attack detected — muted pending ban ({source_kind})",
+                            limit_key="member_ops",
                         )
                         logger.info(
                             "Timed out guild=%s user=%s source=%s",
@@ -1035,6 +1085,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         f"Attack detected; banned by {source_kind} "
                         f"(source_message_id={source_message_id})"
                     ),
+                    limit_key="guild_ban",
                 )
                 logger.warning(
                     "Banned user from %s guild=%s user=%s source_message=%s",
