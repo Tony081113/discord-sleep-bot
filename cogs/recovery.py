@@ -16,6 +16,7 @@ import discord
 from discord.ext import commands
 
 from mods.crypto import decrypt
+from mods.defense import get_defense_state, set_defense_disabled, set_defense_enabled
 from mods.logger import setup_logger
 from mods.rate_limit import (
     CHANNEL_OP_DELAY,
@@ -31,6 +32,7 @@ _RECOVERY_LOOKBACK = 300  # seconds (5 minutes)
 _WEBHOOK_NAME = "SleepBot Recovery"
 _MAX_RESTORE_MESSAGES = 100
 _WEBHOOK_SEND_DELAY = 0.6  # seconds between webhook sends (rate-limit safety)
+_FILE_RESTORE_UNSUPPORTED_TEXT = "暫不支持還原"
 
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -44,6 +46,11 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
         logger.warning("Invalid env %s=%r, fallback=%s", name, raw, default)
         return default
     return max(min_value, min(max_value, value))
+
+
+_RECOVERY_DEFENSE_PAUSE_SECONDS = _env_int(
+    "RECOVERY_DEFENSE_PAUSE_SECONDS", default=180, min_value=60, max_value=900
+)
 
 
 _ROLE_MEMBER_RESTORE_CONCURRENCY = _env_int(
@@ -64,6 +71,9 @@ _CHANNEL_DELETE_CONCURRENCY = _env_int(
 _ROLE_DELETE_CONCURRENCY = _env_int(
     "RECOVERY_ROLE_DELETE_CONCURRENCY", default=2, min_value=1, max_value=4
 )
+_ALERT_EDIT_CONCURRENCY = _env_int(
+    "RECOVERY_ALERT_EDIT_CONCURRENCY", default=3, min_value=1, max_value=8
+)
 
 
 class RecoveryCog(commands.Cog, name="Recovery"):
@@ -73,6 +83,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         self.bot = bot
         # 每個 guild 只允許單一還原流程同時執行，避免併發造成 429。
         self._guild_recovery_locks: dict[str, asyncio.Lock] = {}
+        # 復原階段建立的舊頻道 -> 新頻道映射，供訊息還原精準定位頻道。
+        self._last_channel_restore_map: dict[str, str] = {}
 
     async def run_recovery_with_lock(
         self,
@@ -449,13 +461,14 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             return
 
         empty_view = discord.ui.View() if view is None else view
-        for user_id_str, msg_id in msg_id_map.items():
+
+        async def _edit_one(user_id_str: str, msg_id: int) -> None:
             user = self.bot.get_user(int(user_id_str))
             if not user:
                 try:
                     user = await self.bot.fetch_user(int(user_id_str))
                 except Exception:
-                    continue
+                    return
             try:
                 dm = await user.create_dm()
                 msg = await dm.fetch_message(int(msg_id))
@@ -465,6 +478,11 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     "Failed to edit alert DM user=%s request_id=%s: %s",
                     user_id_str, request_id, exc,
                 )
+
+        await self._gather_bounded(
+            [_edit_one(user_id_str, msg_id) for user_id_str, msg_id in msg_id_map.items()],
+            _ALERT_EDIT_CONCURRENCY,
+        )
 
     # -------------------------------------------------------- 復原主流程
 
@@ -539,6 +557,55 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     len(from_cache),
                 )
                 return from_cache
+
+            # 降級回退：若沒有「5 分鐘前」資料，改用「攻擊發生前」最近快照。
+            relaxed_rows = await store.fetchall(
+                """
+                SELECT s1.target_id, s1.snapshot_data, s1.timestamp
+                FROM structure_snapshots s1
+                INNER JOIN (
+                    SELECT target_id, MAX(timestamp) AS max_ts
+                    FROM structure_snapshots
+                    WHERE guild_id = ? AND target_type = ? AND timestamp <= ?
+                    GROUP BY target_id
+                ) s2 ON s1.target_id = s2.target_id AND s1.timestamp = s2.max_ts
+                WHERE s1.guild_id = ? AND s1.target_type = ?
+                """,
+                [guild_id, target_type, anchor_ts, guild_id, target_type],
+            )
+            if relaxed_rows:
+                logger.warning(
+                    "No clean-5min snapshots; using pre-anchor snapshots guild=%s type=%s anchor_ts=%s rows=%s",
+                    guild_id,
+                    target_type,
+                    anchor_ts,
+                    len(relaxed_rows),
+                )
+                return relaxed_rows
+
+            # 最後回退：使用最早快照，避免完全無法復原。
+            earliest_rows = await store.fetchall(
+                """
+                SELECT s1.target_id, s1.snapshot_data, s1.timestamp
+                FROM structure_snapshots s1
+                INNER JOIN (
+                    SELECT target_id, MIN(timestamp) AS min_ts
+                    FROM structure_snapshots
+                    WHERE guild_id = ? AND target_type = ?
+                    GROUP BY target_id
+                ) s2 ON s1.target_id = s2.target_id AND s1.timestamp = s2.min_ts
+                WHERE s1.guild_id = ? AND s1.target_type = ?
+                """,
+                [guild_id, target_type, guild_id, target_type],
+            )
+            if earliest_rows:
+                logger.warning(
+                    "No pre-anchor snapshots; using earliest snapshots guild=%s type=%s rows=%s",
+                    guild_id,
+                    target_type,
+                    len(earliest_rows),
+                )
+                return earliest_rows
 
             logger.warning(
                 "No clean pre-attack data found guild=%s type=%s anchor_ts=%s clean_before=%s",
@@ -692,7 +759,27 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             )
 
         if not rows:
-            if anchor_ts is None:
+            if anchor_ts is not None:
+                relaxed = await store.fetchall(
+                    """
+                    SELECT snapshot_data
+                    FROM structure_snapshots
+                    WHERE guild_id = ? AND target_type = 'guild' AND target_id = ?
+                      AND timestamp <= ?
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    [guild_id, guild_id, anchor_ts],
+                )
+                if relaxed:
+                    rows = relaxed
+                    logger.warning(
+                        "No clean-5min guild snapshot; using pre-anchor snapshot guild=%s anchor_ts=%s",
+                        guild_id,
+                        anchor_ts,
+                    )
+
+            if not rows:
                 logger.warning(
                     "No pre-attack guild snapshot found guild=%s — falling back to earliest",
                     guild_id,
@@ -807,6 +894,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         current = {str(ch.id): ch for ch in guild.channels}
         used_channel_ids: set[str] = set()
         category_id_map: dict[str, str] = {}
+        channel_restore_map: dict[str, str] = {}
 
         logger.info(
             "Restoring channels guild=%s snapshots=%s current_channels=%s",
@@ -814,6 +902,12 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             len(channel_data_list),
             len(current),
         )
+
+        def _is_category_snapshot(data: dict) -> bool:
+            try:
+                return int(data.get("type", -1)) == int(discord.ChannelType.category.value)
+            except (TypeError, ValueError):
+                return False
 
         def _pick_fallback_channel(data: dict):
             """當快照 ID 已失效時，盡量重用現有同型同名頻道避免重建重複。"""
@@ -840,7 +934,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 existing = _pick_fallback_channel(data)
             if existing is not None:
                 used_channel_ids.add(str(existing.id))
-                if data.get("type") == discord.ChannelType.category.value:
+                channel_restore_map[channel_id] = str(existing.id)
+                if _is_category_snapshot(data):
                     category_id_map[channel_id] = str(existing.id)
 
             try:
@@ -860,9 +955,11 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                     )
                     if (
                         created is not None
-                        and data.get("type") == discord.ChannelType.category.value
+                        and _is_category_snapshot(data)
                     ):
                         category_id_map[channel_id] = str(created.id)
+                    if created is not None:
+                        channel_restore_map[channel_id] = str(created.id)
                 else:
                     logger.info(
                         "Updating existing channel guild=%s channel_id=%s name=%s",
@@ -894,17 +991,55 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         # 兩階段還原：先完整還原類別，再還原子頻道，避免 parent 尚未建立。
         category_data = [
             d for d in channel_data_list
-            if d.get("type") == discord.ChannelType.category.value
+            if _is_category_snapshot(d)
         ]
         other_data = [
             d for d in channel_data_list
-            if d.get("type") != discord.ChannelType.category.value
+            if not _is_category_snapshot(d)
         ]
 
         category_results = await self._gather_bounded(
             [_restore_one_channel(data) for data in sorted(category_data, key=lambda d: d.get("position", 0))],
             _CHANNEL_RESTORE_CONCURRENCY,
         )
+
+        # 保底：若仍有快照中的分類不存在，逐一補建，避免子頻道無法回掛。
+        existing_categories_by_name = {
+            ch.name: ch for ch in guild.channels if isinstance(ch, discord.CategoryChannel)
+        }
+        for data in sorted(category_data, key=lambda d: d.get("position", 0)):
+            cat_id = str(data.get("channel_id", ""))
+            mapped_id = category_id_map.get(cat_id)
+            if mapped_id and guild.get_channel(int(mapped_id)) is not None:
+                continue
+
+            fallback = existing_categories_by_name.get(str(data.get("name", "")))
+            if fallback is not None:
+                category_id_map[cat_id] = str(fallback.id)
+                continue
+
+            try:
+                created = await rate_limited_call(
+                    self._recreate_channel,
+                    guild,
+                    data,
+                    category_id_map,
+                    limit_key="channel_ops",
+                )
+                if created is not None:
+                    category_id_map[cat_id] = str(created.id)
+                    existing_categories_by_name[created.name] = created
+                    restored += 1
+                    await asyncio.sleep(get_adaptive_delay("channel_ops", CHANNEL_OP_DELAY))
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Fallback create category failed guild=%s category_id=%s name=%s: %s",
+                    guild.id,
+                    cat_id,
+                    data.get("name"),
+                    exc,
+                    exc_info=True,
+                )
 
         # 類別可能剛被建立，重抓一次 current 提供下一階段 parent 查找。
         current = {str(ch.id): ch for ch in guild.channels}
@@ -914,6 +1049,57 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             _CHANNEL_RESTORE_CONCURRENCY,
         )
 
+        async def _fix_one_parent(data: dict) -> None:
+            channel_id = str(data.get("channel_id", "")).strip()
+            if not channel_id:
+                return
+            parent_id = str(data.get("parent_id") or "").strip()
+            if not parent_id:
+                return
+
+            mapped_channel_id = channel_restore_map.get(channel_id, channel_id)
+            channel = guild.get_channel(int(mapped_channel_id))
+            if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                return
+
+            mapped_parent_id = category_id_map.get(parent_id, parent_id)
+            parent = guild.get_channel(int(mapped_parent_id))
+            if not isinstance(parent, discord.CategoryChannel):
+                return
+
+            if channel.category_id == parent.id:
+                return
+
+            try:
+                await rate_limited_call(
+                    channel.edit,
+                    category=parent,
+                    limit_key="channel_ops",
+                )
+                logger.info(
+                    "Reattached channel to category guild=%s channel=%s(%s) parent=%s(%s)",
+                    guild.id,
+                    channel.name,
+                    channel.id,
+                    parent.name,
+                    parent.id,
+                )
+                await asyncio.sleep(get_adaptive_delay("channel_ops", CHANNEL_OP_DELAY))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to reattach channel category guild=%s channel_id=%s parent_id=%s: %s",
+                    guild.id,
+                    channel_id,
+                    parent_id,
+                    exc,
+                )
+
+        await self._gather_bounded(
+            [_fix_one_parent(data) for data in other_data],
+            _CHANNEL_RESTORE_CONCURRENCY,
+        )
+
+        self._last_channel_restore_map = dict(channel_restore_map)
         restored = sum(category_results) + sum(other_results)
         return restored
 
@@ -929,7 +1115,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         def _resolve_category(parent_id: str | None):
             if not parent_id:
                 return None
-            mapped_parent_id = category_id_map.get(parent_id, parent_id)
+            normalized_parent_id = str(parent_id).strip()
+            mapped_parent_id = category_id_map.get(normalized_parent_id, normalized_parent_id)
             return guild.get_channel(int(mapped_parent_id))
 
         ch_type = discord.ChannelType(data["type"])
@@ -974,7 +1161,8 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         def _resolve_category(parent_id: str | None):
             if not parent_id:
                 return None
-            mapped_parent_id = category_id_map.get(parent_id, parent_id)
+            normalized_parent_id = str(parent_id).strip()
+            mapped_parent_id = category_id_map.get(normalized_parent_id, normalized_parent_id)
             return guild.get_channel(int(mapped_parent_id))
 
         overwrites = self._build_overwrites(
@@ -1048,120 +1236,168 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         4. 解除快照的保留標記（pinned）。
         """
         guild_id = str(guild.id)
+        defense_temporarily_disabled = False
 
-        # ── Step 1: 預載快照資料到記憶體 ────────────────────────────────
-        anchor_ts = await self._get_recovery_anchor_timestamp(store, guild_id, request_id)
-        guild_snap = await self._get_latest_guild_snapshot(store, guild_id, anchor_ts)
-        channel_snaps = await self._get_pre_attack_snapshots(
-            store,
-            guild_id,
-            "channel",
-            anchor_ts,
-        )
-        role_snaps = await self._get_pre_attack_snapshots(
-            store,
-            guild_id,
-            "role",
-            anchor_ts,
-        )
-        member_snaps = await self._get_pre_attack_snapshots(
-            store,
-            guild_id,
-            "member",
-            anchor_ts,
-        )
-
-        def _load_snapshot_rows(rows: list[dict[str, Any]], id_key: str) -> list[dict[str, Any]]:
-            loaded: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
-            for row in rows:
-                raw = row.get("snapshot_data")
-                if not raw:
-                    continue
-                try:
-                    payload = json.loads(raw)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Skip invalid snapshot JSON guild=%s id_key=%s target=%s: %s",
-                        guild_id,
-                        id_key,
-                        row.get("target_id"),
-                        exc,
-                    )
-                    continue
-
-                if not isinstance(payload, dict):
-                    continue
-                entity_id = str(payload.get(id_key) or row.get("target_id") or "").strip()
-                if not entity_id or entity_id in seen_ids:
-                    continue
-                payload[id_key] = entity_id
-                seen_ids.add(entity_id)
-                loaded.append(payload)
-            return loaded
-
-        channel_data_list = _load_snapshot_rows(channel_snaps, "channel_id")
-        role_data_list = _load_snapshot_rows(role_snaps, "role_id")
-        member_data_list = _load_snapshot_rows(member_snaps, "user_id")
-
-        # 嘗試寫入 Redis（如可用）；失敗時僅使用記憶體快取繼續執行。
-        await self._cache_snapshots_to_redis(store, guild_id, request_id, channel_data_list, role_data_list)
-
-        snapshot_channel_ids = {d["channel_id"] for d in channel_data_list}
-        snapshot_role_ids = {d["role_id"] for d in role_data_list}
-
-        logger.info(
-            "Recovery snapshots loaded guild=%s request_id=%s anchor_ts=%s channels=%s roles=%s members=%s",
-            guild_id,
-            request_id,
-            anchor_ts,
-            len(channel_data_list),
-            len(role_data_list),
-            len(member_data_list),
-        )
-
-        safety_issues = self._check_recovery_safety(
-            guild,
-            channel_data_list,
-            role_data_list,
-        )
-        if safety_issues:
-            logger.error(
-                "Recovery safety abort guild=%s request_id=%s issues=%s",
+        try:
+            defense_state = await get_defense_state(store, guild_id)
+            if defense_state.get("enabled", True):
+                await set_defense_disabled(
+                    store,
+                    guild_id,
+                    updated_by=f"recovery:{request_id or 'manual'}",
+                    duration_seconds=_RECOVERY_DEFENSE_PAUSE_SECONDS,
+                )
+                defense_temporarily_disabled = True
+                logger.info(
+                    "Defense temporarily disabled for recovery guild=%s request_id=%s seconds=%s",
+                    guild_id,
+                    request_id,
+                    _RECOVERY_DEFENSE_PAUSE_SECONDS,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to disable defense during recovery guild=%s request_id=%s: %s",
                 guild_id,
                 request_id,
-                ", ".join(safety_issues),
-            )
-            raise RuntimeError(
-                "Recovery safety abort: clean pre-attack snapshots are insufficient"
+                exc,
+                exc_info=True,
             )
 
-        # ── Step 2: 刪除快照中不存在的多餘身分組、頻道 ─────────────────
-        await self._delete_extra_roles(guild, snapshot_role_ids)
-        await self._delete_extra_channels(guild, snapshot_channel_ids)
+        try:
+            # ── Step 1: 預載快照資料到記憶體 ────────────────────────────────
+            anchor_ts = await self._get_recovery_anchor_timestamp(store, guild_id, request_id)
+            guild_snap = await self._get_latest_guild_snapshot(store, guild_id, anchor_ts)
+            channel_snaps = await self._get_pre_attack_snapshots(
+                store,
+                guild_id,
+                "channel",
+                anchor_ts,
+            )
+            role_snaps = await self._get_pre_attack_snapshots(
+                store,
+                guild_id,
+                "role",
+                anchor_ts,
+            )
+            member_snaps = await self._get_pre_attack_snapshots(
+                store,
+                guild_id,
+                "member",
+                anchor_ts,
+            )
 
-        # ── Step 3: 依序還原 ─────────────────────────────────────────────
-        # 3a. 伺服器名稱 / 橫幅
-        await self._restore_guild_profile(guild, guild_snap)
-        # 3b. 身分組屬性
-        restored_ro, failed_roles = await self._restore_roles(guild, role_data_list)
-        # 3c. 身分組成員
-        await self._restore_role_members(guild, role_data_list)
-        # 3c-2. 成員暱稱（404 找不到使用者時忽略）
-        await self._restore_member_nicks(guild, member_data_list)
-        # 3d. 頻道
-        restored_ch = await self._restore_channels(guild, channel_data_list)
-        # 3e. 訊息
-        restored_ms = await self._restore_messages(store, guild)
+            def _load_snapshot_rows(rows: list[dict[str, Any]], id_key: str) -> list[dict[str, Any]]:
+                loaded: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                for row in rows:
+                    raw = row.get("snapshot_data")
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Skip invalid snapshot JSON guild=%s id_key=%s target=%s: %s",
+                            guild_id,
+                            id_key,
+                            row.get("target_id"),
+                            exc,
+                        )
+                        continue
 
-        # ── Step 4: 解除快照保留標記 ─────────────────────────────────────
-        await self._unpin_snapshots(store, guild_id)
+                    if not isinstance(payload, dict):
+                        continue
+                    entity_id = str(payload.get(id_key) or row.get("target_id") or "").strip()
+                    if not entity_id or entity_id in seen_ids:
+                        continue
+                    payload[id_key] = entity_id
+                    seen_ids.add(entity_id)
+                    loaded.append(payload)
+                return loaded
 
-        logger.info(
-            "Recovery finished guild=%s request_id=%s channels=%d roles=%d messages=%d failed_roles=%d",
-            guild_id, request_id, restored_ch, restored_ro, restored_ms, len(failed_roles),
-        )
-        return restored_ch, restored_ro, restored_ms, failed_roles
+            channel_data_list = _load_snapshot_rows(channel_snaps, "channel_id")
+            role_data_list = _load_snapshot_rows(role_snaps, "role_id")
+            member_data_list = _load_snapshot_rows(member_snaps, "user_id")
+
+            # 嘗試寫入 Redis（如可用）；失敗時僅使用記憶體快取繼續執行。
+            await self._cache_snapshots_to_redis(store, guild_id, request_id, channel_data_list, role_data_list)
+
+            snapshot_channel_ids = {d["channel_id"] for d in channel_data_list}
+            snapshot_role_ids = {d["role_id"] for d in role_data_list}
+
+            logger.info(
+                "Recovery snapshots loaded guild=%s request_id=%s anchor_ts=%s channels=%s roles=%s members=%s",
+                guild_id,
+                request_id,
+                anchor_ts,
+                len(channel_data_list),
+                len(role_data_list),
+                len(member_data_list),
+            )
+
+            safety_issues = self._check_recovery_safety(
+                guild,
+                channel_data_list,
+                role_data_list,
+            )
+            if safety_issues:
+                logger.error(
+                    "Recovery safety abort guild=%s request_id=%s issues=%s",
+                    guild_id,
+                    request_id,
+                    ", ".join(safety_issues),
+                )
+                raise RuntimeError(
+                    "Recovery safety abort: clean pre-attack snapshots are insufficient"
+                )
+
+            # ── Step 2: 刪除快照中不存在的多餘身分組、頻道 ─────────────────
+            await self._delete_extra_roles(guild, snapshot_role_ids)
+            await self._delete_extra_channels(guild, snapshot_channel_ids)
+
+            # ── Step 3: 依序還原 ─────────────────────────────────────────────
+            # 3a. 伺服器名稱 / 橫幅
+            await self._restore_guild_profile(guild, guild_snap)
+            # 3b. 身分組屬性
+            restored_ro, failed_roles = await self._restore_roles(guild, role_data_list)
+            # 3c. 身分組成員
+            await self._restore_role_members(guild, role_data_list)
+            # 3c-2. 成員暱稱（404 找不到使用者時忽略）
+            await self._restore_member_nicks(guild, member_data_list)
+            # 3d. 頻道
+            restored_ch = await self._restore_channels(guild, channel_data_list)
+            # 3e. 訊息
+            restored_ms = await self._restore_messages(store, guild)
+
+            # ── Step 4: 解除快照保留標記 ─────────────────────────────────────
+            await self._unpin_snapshots(store, guild_id)
+
+            logger.info(
+                "Recovery finished guild=%s request_id=%s channels=%d roles=%d messages=%d failed_roles=%d",
+                guild_id, request_id, restored_ch, restored_ro, restored_ms, len(failed_roles),
+            )
+            return restored_ch, restored_ro, restored_ms, failed_roles
+        finally:
+            if defense_temporarily_disabled:
+                try:
+                    await set_defense_enabled(
+                        store,
+                        guild_id,
+                        updated_by=f"recovery:{request_id or 'manual'}",
+                    )
+                    logger.info(
+                        "Defense re-enabled after recovery guild=%s request_id=%s",
+                        guild_id,
+                        request_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to re-enable defense after recovery guild=%s request_id=%s: %s",
+                        guild_id,
+                        request_id,
+                        exc,
+                        exc_info=True,
+                    )
 
     # -------------------------------------------------------- 快取與輔助工具
 
@@ -1198,8 +1434,10 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 pairs = {chunk[j]: chunk[j + 1] for j in range(0, len(chunk), 2)}
                 await redis.mset(pairs)
             # 為每個 key 設定 TTL。
+            pipe = redis.pipeline(transaction=False)
             for i in range(0, len(batch), 2):
-                await redis.expire(batch[i], 3600)
+                pipe.expire(batch[i], 3600)
+            await pipe.execute()
             logger.info(
                 "Cached %d snapshot(s) to Redis guild=%s request_id=%s",
                 len(batch) // 2, guild_id, request_id,
@@ -1587,6 +1825,36 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         """將舊頻道加密訊息重送到新頻道，附還原時間標記。"""
         guild_id = str(guild.id)
 
+        def _build_restored_message(msg: dict[str, Any]) -> str:
+            raw_content = decrypt(msg["encrypted_content"], msg["nonce"])
+            safe_content = discord.utils.escape_mentions(raw_content or "").replace("\x00", "")
+
+            attachment_names: list[str] = []
+            raw_names = msg.get("attachment_names")
+            if raw_names:
+                try:
+                    parsed = json.loads(raw_names)
+                    if isinstance(parsed, list):
+                        attachment_names = [str(n).replace("\n", " ").replace("\r", " ")[:120] for n in parsed]
+                except Exception:
+                    attachment_names = []
+
+            lines: list[str] = []
+            if safe_content.strip():
+                lines.append(safe_content)
+            for name in attachment_names:
+                lines.append(f"[{name}] {_FILE_RESTORE_UNSUPPORTED_TEXT}")
+
+            if not lines:
+                lines.append("[空白訊息]")
+
+            body = "\n".join(lines)
+            if len(body) > 1700:
+                body = body[:1700] + "\n...(內容過長已截斷)"
+
+            ts = msg["timestamp"]
+            return f"{body}\n\n*(由系統於 <t:{ts}:f> 還原)*"
+
         deleted = await store.fetchall(
             """
             SELECT DISTINCT target_id, old_data FROM temp_cache
@@ -1610,9 +1878,32 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             ch_data = json.loads(event["old_data"]) if event["old_data"] else {}
             ch_name = ch_data.get("name", "unknown")
 
-            new_channel = discord.utils.get(guild.text_channels, name=ch_name)
+            ch_type = ch_data.get("type")
+            if ch_type != discord.ChannelType.text.value:
+                logger.debug(
+                    "Skip message restore for non-text channel guild=%s old_channel=%s type=%s name=%s",
+                    guild_id,
+                    old_ch_id,
+                    ch_type,
+                    ch_name,
+                )
+                return 0
+
+            mapped_new_id = self._last_channel_restore_map.get(str(old_ch_id))
+            new_channel = None
+            if mapped_new_id:
+                mapped = guild.get_channel(int(mapped_new_id))
+                if isinstance(mapped, discord.TextChannel):
+                    new_channel = mapped
             if new_channel is None:
-                logger.warning("No recreated channel '%s' for message restore", ch_name)
+                new_channel = discord.utils.get(guild.text_channels, name=ch_name)
+            if new_channel is None:
+                logger.warning(
+                    "No recreated text channel for message restore guild=%s old_channel=%s name=%s",
+                    guild_id,
+                    old_ch_id,
+                    ch_name,
+                )
                 return 0
 
             messages = await store.fetchall(
@@ -1648,13 +1939,12 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             channel_restored = 0
             for msg in messages:
                 try:
-                    content = decrypt(msg["encrypted_content"], msg["nonce"])
-                    ts = msg["timestamp"]
                     await rate_limited_call(
                         webhook.send,
-                        content=f"{content}\n\n*(由系統於 <t:{ts}:f> 還原)*",
+                        content=_build_restored_message(msg),
                         username=msg["author_name"],
                         avatar_url=msg.get("author_avatar"),
+                        allowed_mentions=discord.AllowedMentions.none(),
                         limit_key="webhook_send",
                     )
                     channel_restored += 1
