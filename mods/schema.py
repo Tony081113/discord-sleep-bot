@@ -82,6 +82,7 @@ _TABLES_DDL: list[str] = [
         author_name       TEXT NOT NULL,
         author_avatar     TEXT,
         encrypted_content TEXT NOT NULL,
+        attachment_names  TEXT,
         nonce             TEXT NOT NULL,
         timestamp         INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
         FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
@@ -202,12 +203,35 @@ async def init_schema(store: DataStore) -> None:
         "ALTER TABLE structure_snapshots ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE recovery_requests ADD COLUMN alert_msg_ids TEXT DEFAULT NULL",
         "ALTER TABLE recovery_requests ADD COLUMN attacker_ids TEXT DEFAULT NULL",
+        "ALTER TABLE encrypted_messages ADD COLUMN attachment_names TEXT",
     ]
     for migration in _MIGRATIONS:
         try:
             await store.execute(migration)
             logger.info("Migration applied: %s", migration[:60])
-        except Exception:  # column already exists or other benign error
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Ignore only already-exists style errors; log others for visibility.
+            msg = str(exc).lower()
+            benign = (
+                "duplicate column name" in msg
+                or "already exists" in msg
+            )
+            if not benign:
+                logger.warning("Migration failed: %s | err=%s", migration, exc)
+
+    # 強化檢查：D1 若曾發生靜默 migration 失敗，啟動時主動補 attachment_names 欄位。
+    try:
+        cols = await store.fetchall("PRAGMA table_info(encrypted_messages)")
+        col_names = {str(r.get("name", "")) for r in cols}
+        if "attachment_names" not in col_names:
+            await store.execute(
+                "ALTER TABLE encrypted_messages ADD COLUMN attachment_names TEXT"
+            )
+            logger.info("Schema heal applied: encrypted_messages.attachment_names")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Schema heal failed for encrypted_messages.attachment_names: %s",
+            exc,
+        )
 
     logger.info("Schema initialised (%d tables)", len(_TABLES_DDL))

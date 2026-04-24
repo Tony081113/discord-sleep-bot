@@ -22,6 +22,7 @@ logger = setup_logger(__name__)
 
 # Discord 官方私訊疑難排解頁面
 _DM_HELP_URL = "https://support.discord.com/hc/en-us/articles/217916488"
+_SNAPSHOT_WRITE_CONCURRENCY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,18 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def _gather_bounded(self, coros: list, limit: int) -> list:
+        """有上限併發工具：避免一次大量 DM 觸發速率限制。"""
+        if not coros:
+            return []
+        sem = asyncio.Semaphore(max(1, limit))
+
+        async def _runner(coro):
+            async with sem:
+                return await coro
+
+        return await asyncio.gather(*(_runner(c) for c in coros), return_exceptions=False)
 
     # ------------------------------------------------- slash commands
 
@@ -358,7 +371,7 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
         )
 
         # 2. Store channels + snapshots
-        for channel in guild.channels:
+        async def _store_channel_snapshot(channel: discord.abc.GuildChannel) -> None:
             ch_data = _channel_to_dict(channel)
             await store.execute(
                 """
@@ -379,8 +392,13 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
                 [guild_id, "channel", str(channel.id), json.dumps(ch_data, ensure_ascii=False)],
             )
 
+        await self._gather_bounded(
+            [_store_channel_snapshot(channel) for channel in guild.channels],
+            _SNAPSHOT_WRITE_CONCURRENCY,
+        )
+
         # 3. Store roles + snapshots
-        for role in guild.roles:
+        async def _store_role_snapshot(role: discord.Role) -> None:
             r_data = _role_to_dict(role)
             await store.execute(
                 """
@@ -402,13 +420,23 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
                 [guild_id, "role", str(role.id), json.dumps(r_data, ensure_ascii=False)],
             )
 
+        await self._gather_bounded(
+            [_store_role_snapshot(role) for role in guild.roles],
+            _SNAPSHOT_WRITE_CONCURRENCY,
+        )
+
         # 3.5 Store member nick snapshots
-        for member in guild.members:
+        async def _store_member_snapshot(member: discord.Member) -> None:
             m_data = _member_to_dict(member)
             await store.execute(
                 "INSERT INTO structure_snapshots (guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
                 [guild_id, "member", str(member.id), json.dumps(m_data, ensure_ascii=False)],
             )
+
+        await self._gather_bounded(
+            [_store_member_snapshot(member) for member in guild.members],
+            _SNAPSHOT_WRITE_CONCURRENCY,
+        )
 
         logger.info(
             "Initial snapshot stored for '%s': %d channels, %d roles",
@@ -422,9 +450,14 @@ class OnboardingCog(commands.Cog, name="Onboarding"):
         ]
         logger.info("Found %d administrator(s) in '%s'", len(admins), guild.name)
 
-        for admin in admins:
+        async def _send_one(admin: discord.Member) -> None:
             await self._send_approval_dm(admin, guild)
             await dm_sleep()
+
+        await self._gather_bounded(
+            [_send_one(admin) for admin in admins],
+            limit=2,
+        )
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:

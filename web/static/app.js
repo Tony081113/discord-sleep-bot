@@ -168,6 +168,7 @@ function renderApp() {
           <li class="nav-item active" data-page="overview"><span class="icon">📊</span> 概覽</li>
           <li class="nav-item" data-page="recovery"><span class="icon">🔄</span> 復原管理</li>
           <li class="nav-item" data-page="thresholds"><span class="icon">⚙️</span> 門檻設定</li>
+          <li class="nav-item" data-page="developer" id="devTab" style="display:none"><span class="icon">🔧</span> 開發者</li>
         </ul>
         <div class="sidebar-footer">
           <div class="user-block">${avatarEl}<span class="user-name">${esc(u.username)}</span></div>
@@ -203,6 +204,7 @@ function renderApp() {
 
 // ── Navigation ───────────────────────────────────────────
 function navigate(page) {
+  if (_devPoller && page !== 'developer') { clearInterval(_devPoller); _devPoller = null; }
   S.page = page;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
@@ -214,7 +216,7 @@ function renderPage() {
   const area = document.getElementById('pageArea');
   if (!area) return;
   area.innerHTML = loadingHTML();
-  const pages = { overview: pageOverview, recovery: pageRecovery, thresholds: pageThresholds };
+  const pages = { overview: pageOverview, recovery: pageRecovery, thresholds: pageThresholds, developer: pageDeveloper };
   (pages[S.page] || pageOverview)(area);
 }
 
@@ -564,6 +566,275 @@ async function saveThresholds(el) {
   btn.disabled = false;
 }
 
+
+// ── Developer page state ─────────────────────────────────
+const _devNetHistory = [];   // [{ts, sent, recv}]  最多 60 筆
+let _devPoller = null;
+
+// ── Page: developer ──────────────────────────────────────
+async function pageDeveloper(el) {
+  if (_devPoller) { clearInterval(_devPoller); _devPoller = null; }
+  try {
+    const [devInfo, stats] = await Promise.all([
+      api('/api/dev/info'),
+      api('/api/dev/ratelimit-stats?minutes=5'),
+    ]);
+
+    if (!devInfo.is_developer) {
+      el.innerHTML = emptyHTML('🔒', '你不是開發者');
+      return;
+    }
+
+    const stat = stats.stats || {};
+    let html = `<div class="page-header"><h2>⚙️ 開發者面板</h2><button class="btn btn-ghost btn-sm" onclick="navigate('developer')">↻ 重新整理</button></div>`;
+
+    // ── 系統資源表 ────────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">🖥️ 系統資源</div>
+      <table style="width:100%;font-size:.9rem;border-collapse:collapse" id="devSysTable">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:.45rem .6rem;color:var(--text-3)">項目</th>
+          <th style="text-align:right;padding:.45rem .6rem;color:var(--text-3)">數值</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:.4rem .6rem">系統 CPU</td><td style="text-align:right;padding:.4rem .6rem" id="dsc">—</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:.4rem .6rem">系統 RAM 使用</td><td style="text-align:right;padding:.4rem .6rem" id="dsr">—</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:.4rem .6rem">RAM 使用率</td><td style="text-align:right;padding:.4rem .6rem" id="dsrp">—</td></tr>
+      </table>
+    </div>`;
+
+    // ── 程式資源表 ────────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">🤖 Bot 程式資源</div>
+      <table style="width:100%;font-size:.9rem;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:.45rem .6rem;color:var(--text-3)">項目</th>
+          <th style="text-align:right;padding:.45rem .6rem;color:var(--text-3)">數值</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:.4rem .6rem">程式 CPU</td><td style="text-align:right;padding:.4rem .6rem" id="dpc">—</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:.4rem .6rem">程式 RAM (RSS)</td><td style="text-align:right;padding:.4rem .6rem" id="dpr">—</td></tr>
+      </table>
+    </div>`;
+
+    // ── Redis RAM ────────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">🗄️ Redis 記憶體</div>
+      <div id="devRedis" style="font-size:.9rem">—</div>
+    </div>`;
+
+    // ── 網路圖 ────────────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">🌐 網路 I/O（即時，每 3 秒更新）</div>
+      <div style="display:flex;gap:1rem;margin-bottom:.6rem">
+        <span style="font-size:.85rem;color:#4ade80">▲ 上傳：<strong id="devNetUp">—</strong></span>
+        <span style="font-size:.85rem;color:#60a5fa">▼ 下載：<strong id="devNetDn">—</strong></span>
+      </div>
+      <canvas id="devNetCanvas" width="600" height="120" style="width:100%;background:var(--surface-2);border-radius:.5rem"></canvas>
+    </div>`;
+
+    // ── Rate-limit 統計 ───────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">📊 Rate-limit 統計（最近 5 分鐘）<span id="devRlTs" style="font-size:.75rem;color:var(--text-3);margin-left:.6rem"></span></div>
+      <div id="devRlBody">—</div>
+    </div>`;
+
+    el.innerHTML = html;
+    _devRenderRl(stat);
+    _devStartPoller(el);
+
+  } catch (e) {
+    if (_devPoller) { clearInterval(_devPoller); _devPoller = null; }
+    if (e.message === 'unauthorized') return;
+    el.innerHTML = emptyHTML('😴', randomError());
+  }
+}
+
+function _fmtBytes(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB/s';
+  if (b >= 1024) return (b / 1024).toFixed(1) + ' KB/s';
+  return b.toFixed(0) + ' B/s';
+}
+
+function _devDrawChart(canvas) {
+  if (!canvas || _devNetHistory.length < 2) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = _devNetHistory.slice(-60);
+  const maxVal = Math.max(...pts.flatMap(p => [p.sent, p.recv]), 1);
+
+  const padL = 52, padR = 8, padT = 8, padB = 20;
+  const cw = w - padL - padR, ch = h - padT - padB;
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + ch - (ch * i / 4);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(_fmtBytes(maxVal * i / 4), padL - 4, y + 3);
+  }
+
+  function drawLine(getV, color) {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    pts.forEach((p, i) => {
+      const x = padL + (i / (pts.length - 1)) * cw;
+      const y = padT + ch - (getV(p) / maxVal) * ch;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Fill
+    ctx.save();
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    pts.forEach((p, i) => {
+      const x = padL + (i / (pts.length - 1)) * cw;
+      const y = padT + ch - (getV(p) / maxVal) * ch;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.lineTo(padL + cw, padT + ch);
+    ctx.lineTo(padL, padT + ch);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  drawLine(p => p.sent, '#4ade80');
+  drawLine(p => p.recv, '#60a5fa');
+
+  // Legend
+  ctx.font = '10px sans-serif';
+  ctx.fillStyle = '#4ade80'; ctx.fillRect(padL, h - 14, 10, 3);
+  ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.textAlign = 'left';
+  ctx.fillText('上傳', padL + 14, h - 10);
+  ctx.fillStyle = '#60a5fa'; ctx.fillRect(padL + 60, h - 14, 10, 3);
+  ctx.fillStyle = 'rgba(255,255,255,.6)';
+  ctx.fillText('下載', padL + 74, h - 10);
+}
+
+function _devUpdateDOM(d) {
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  if (d.system) {
+    set('dsc', d.system.cpu_percent + '%');
+    set('dsr', d.system.ram_used_mb.toFixed(0) + ' MB / ' + d.system.ram_total_mb.toFixed(0) + ' MB');
+    set('dsrp', d.system.ram_percent + '%');
+  }
+  if (d.process) {
+    set('dpc', d.process.cpu_percent + '%');
+    set('dpr', d.process.ram_mb.toFixed(1) + ' MB');
+  }
+  if (d.network) {
+    set('devNetUp', _fmtBytes(d.network.bytes_sent_per_s));
+    set('devNetDn', _fmtBytes(d.network.bytes_recv_per_s));
+    _devNetHistory.push({ ts: d.timestamp, sent: d.network.bytes_sent_per_s, recv: d.network.bytes_recv_per_s });
+    if (_devNetHistory.length > 60) _devNetHistory.shift();
+    const canvas = document.getElementById('devNetCanvas');
+    if (canvas) {
+      canvas.width = canvas.offsetWidth || 600;
+      _devDrawChart(canvas);
+    }
+  }
+  if (d.redis) {
+    const el = document.getElementById('devRedis');
+    if (!el) return;
+    if (!d.redis.available) { el.innerHTML = '<span style="color:var(--text-3)">Redis 離線</span>'; return; }
+    const used = d.redis.used_memory_mb;
+    const max = d.redis.maxmemory_mb;
+    const pct = d.redis.used_memory_percent;
+    let bar = '';
+    if (max && pct !== null) {
+      const barPct = Math.min(100, pct);
+      const col = barPct > 85 ? 'var(--danger)' : barPct > 60 ? '#f59e0b' : '#4ade80';
+      bar = `<div style="margin:.5rem 0;height:8px;background:var(--border);border-radius:4px;overflow:hidden">
+        <div style="width:${barPct}%;height:100%;background:${col};transition:width .3s"></div>
+      </div>
+      <div style="font-size:.82rem;color:var(--text-3)">${used.toFixed(1)} MB / ${max.toFixed(1)} MB（${pct}%）</div>`;
+    } else {
+      bar = `<div style="font-size:.9rem">${used.toFixed(1)} MB <span style="color:var(--text-3)">（未設 maxmemory）</span></div>`;
+    }
+    el.innerHTML = bar;
+  }
+}
+
+function _devRenderRl(stat) {
+  const body = document.getElementById('devRlBody');
+  if (!body) return;
+  let h = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem;margin-bottom:1rem">
+    <div style="background:var(--surface-2);padding:1rem;border-radius:.5rem">
+      <div style="font-size:.8rem;color:var(--text-3)">總 429 次數</div>
+      <div style="font-size:1.5rem;font-weight:600;color:var(--danger)">${stat.total_429s || 0}</div>
+    </div>`;
+  if (stat.by_scope && Object.keys(stat.by_scope).length > 0) {
+    h += `<div style="background:var(--surface-2);padding:1rem;border-radius:.5rem">
+      <div style="font-size:.8rem;color:var(--text-3);margin-bottom:.4rem">Scope 分佈</div>`;
+    for (const [scope, count] of Object.entries(stat.by_scope))
+      h += `<div style="font-size:.85rem"><span style="color:var(--text-2)">${esc(scope)}:</span> <strong>${count}</strong></div>`;
+    h += `</div>`;
+  }
+  h += `</div>`;
+  if (stat.by_limit_key && Object.keys(stat.by_limit_key).length > 0) {
+    h += `<div style="font-size:.85rem;font-weight:600;margin:.4rem 0">🔑 按操作類型</div>
+      <table style="width:100%;font-size:.9rem;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:.4rem .6rem;color:var(--text-3)">操作類型</th>
+          <th style="text-align:right;padding:.4rem .6rem;color:var(--text-3)">429 次數</th></tr>`;
+    for (const [key, count] of Object.entries(stat.by_limit_key))
+      h += `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:.4rem .6rem">${esc(key)}</td>
+        <td style="text-align:right;padding:.4rem .6rem"><strong>${count}</strong></td></tr>`;
+    h += `</table>`;
+  }
+  if (stat.by_bucket && Object.keys(stat.by_bucket).length > 0) {
+    h += `<div style="font-size:.85rem;font-weight:600;margin:.8rem 0 .4rem">🪣 熱點 Bucket（Top 10）</div><div style="display:grid;gap:.4rem">`;
+    for (const [bucket, count] of Object.entries(stat.by_bucket)) {
+      const pct = stat.total_429s > 0 ? Math.round((count / stat.total_429s) * 100) : 0;
+      h += `<div style="display:flex;align-items:center;gap:.8rem;padding:.4rem .6rem;background:var(--surface-2);border-radius:.3rem">
+        <span style="flex:1;font-family:monospace;font-size:.8rem;word-break:break-all">${esc(bucket)}</span>
+        <div style="width:60px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;flex-shrink:0">
+          <div style="width:${pct}%;height:100%;background:var(--danger)"></div></div>
+        <span style="font-size:.82rem;color:var(--text-2);min-width:50px;text-align:right">${count} (${pct}%)</span></div>`;
+    }
+    h += `</div>`;
+  }
+  body.innerHTML = h;
+  const ts = document.getElementById('devRlTs');
+  if (ts) ts.textContent = '更新於 ' + new Date().toLocaleTimeString();
+}
+
+let _devRlTick = 0;
+function _devStartPoller(el) {
+  const tick = async () => {
+    if (!document.getElementById('devNetCanvas')) {
+      clearInterval(_devPoller); _devPoller = null; return;
+    }
+    _devRlTick++;
+    try {
+      const d = await api('/api/dev/system-stats');
+      if (d.success) _devUpdateDOM(d);
+    } catch (_) { /* silently ignore */ }
+    // Rate-limit stats: update every 5 ticks (~15s)
+    if (_devRlTick % 5 === 0) {
+      try {
+        const r = await api('/api/dev/ratelimit-stats?minutes=5');
+        if (r.success) _devRenderRl(r.stats || {});
+      } catch (_) { /* silently ignore */ }
+    }
+  };
+  tick();
+  _devPoller = setInterval(tick, 3000);
+}
+
 // ── Init ─────────────────────────────────────────────────
 async function init() {
   try {
@@ -585,6 +856,22 @@ async function init() {
       return;
     }
     renderApp();
+    
+    // Check if user is developer
+    try {
+      const devInfo = await api('/api/dev/info');
+      console.log('[DEBUG] devInfo:', devInfo);
+      if (devInfo.is_developer) {
+        const tab = document.getElementById('devTab');
+        if (tab) {
+          tab.style.display = 'block';
+          console.log('[DEBUG] Developer tab shown');
+        }
+      }
+    } catch (e) {
+      // Not a developer or endpoint not available, silently ignore
+      console.log('[DEBUG] Dev check failed:', e.message);
+    }
   } catch (e) {
     if (e.message === 'unauthorized') { renderLogin(); return; }
     document.getElementById('app').innerHTML = `

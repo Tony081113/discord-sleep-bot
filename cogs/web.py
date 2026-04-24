@@ -26,12 +26,15 @@ import secrets
 import time
 from typing import Any
 
+import psutil
+
 import aiohttp
 import discord
 from aiohttp import web
 from discord.ext import commands
 
 from mods.defense import (
+    DefenseStorageError,
     DEFAULT_DISABLE_SECONDS,
     get_defense_state,
     set_defense_disabled,
@@ -42,18 +45,30 @@ from mods.storage import get_storage
 
 logger = setup_logger(__name__)
 
+# ── 系統資源監控（網路 I/O delta 追蹤） ────────────────
+_net_prev: dict = {}   # {"bytes_sent": int, "bytes_recv": int, "ts": float}
+_bot_proc = psutil.Process()
+
 # ── Discord OAuth2 端點 ─────────────────────────────
 _DISCORD_AUTH = "https://discord.com/api/oauth2/authorize"
 _DISCORD_TOKEN = "https://discord.com/api/oauth2/token"
 _DISCORD_USER = "https://discord.com/api/v10/users/@me"
 
-# ── 設定值（載入模組時讀取一次） ─────────────────────────
+# ═════════════════════════════════════════════════════════
+#  設定值（載入模組時讀取一次） ─────────────────────────
+# ═════════════════════════════════════════════════════════
 _HOST = os.getenv("WEB_HOST", "0.0.0.0")
 _PORT = int(os.getenv("WEB_PORT", "8080"))
 _BASE_URL = (os.getenv("WEB_BASE_URL") or "").rstrip("/") or f"http://localhost:{_PORT}"
 _SECRET = os.getenv("WEB_SECRET", "")
 _CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 _CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+_DEVELOPER_IDS = set(
+    str(uid.strip())
+    for uid in os.getenv("BOT_ADMIN_ID", "").split(",")
+    if uid.strip()
+)
+logger.info(f"Loaded _DEVELOPER_IDS: {_DEVELOPER_IDS}")
 
 if not _SECRET or len(_SECRET) < 32:
     _SECRET = secrets.token_hex(32)
@@ -143,6 +158,26 @@ def _auth(fn):
         s = _session(req)
         if not s:
             return web.json_response({"error": "未登入，請重新登入"}, status=401)
+        req["s"] = s
+        return await fn(req)
+    return wrapper
+
+
+def _require_developer(fn):
+    """需要開發者身份的 API 裝飾器。"""
+    @functools.wraps(fn)
+    async def wrapper(req: web.Request) -> web.Response:
+        s = _session(req)
+        if not s:
+            return web.json_response({"error": "未登入，請重新登入"}, status=401)
+        user_id = str(s.get("id", ""))
+        logger.debug(f"Dev check: user_id={user_id!r}, _DEVELOPER_IDS={_DEVELOPER_IDS}")
+        if user_id not in _DEVELOPER_IDS:
+            logger.warning(f"Non-developer access attempt: {user_id}")
+            return web.json_response(
+                {"error": "你不是開發者，無法訪問此功能"},
+                status=403
+            )
         req["s"] = s
         return await fn(req)
     return wrapper
@@ -648,8 +683,15 @@ async def _api_defense_status(req: web.Request) -> web.Response:
         return err
 
     store = get_storage()
-    defense = await get_defense_state(store, gid)
-    return web.json_response({"defense": defense})
+    try:
+        defense = await get_defense_state(store, gid)
+        return web.json_response({"defense": defense})
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to read defense status gid=%s: %s", gid, exc, exc_info=True)
+        return web.json_response(
+            {"error": "防禦狀態讀取失敗，請稍後再試"},
+            status=503,
+        )
 
 
 @_auth
@@ -672,13 +714,31 @@ async def _api_defense_disable(req: web.Request) -> web.Response:
         pass
 
     store = get_storage()
-    defense = await set_defense_disabled(store, gid, uid, duration_seconds=duration)
-    return web.json_response(
-        {
-            "message": "防禦系統已暫時關閉",
-            "defense": defense,
-        }
-    )
+    try:
+        defense = await set_defense_disabled(store, gid, uid, duration_seconds=duration)
+        return web.json_response(
+            {
+                "message": "防禦系統已暫時關閉",
+                "defense": defense,
+            }
+        )
+    except DefenseStorageError:
+        logger.warning(
+            "Failed to disable defense gid=%s uid=%s",
+            gid,
+            uid,
+            exc_info=True,
+        )
+        return web.json_response(
+            {"error": "防禦操作失敗：儲存服務暫時不可用"},
+            status=503,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to disable defense gid=%s uid=%s: %s", gid, uid, exc, exc_info=True)
+        return web.json_response(
+            {"error": "防禦操作失敗，請稍後重試"},
+            status=500,
+        )
 
 
 @_auth
@@ -690,13 +750,31 @@ async def _api_defense_enable(req: web.Request) -> web.Response:
         return err
 
     store = get_storage()
-    defense = await set_defense_enabled(store, gid, uid)
-    return web.json_response(
-        {
-            "message": "防禦系統已重新啟用",
-            "defense": defense,
-        }
-    )
+    try:
+        defense = await set_defense_enabled(store, gid, uid)
+        return web.json_response(
+            {
+                "message": "防禦系統已重新啟用",
+                "defense": defense,
+            }
+        )
+    except DefenseStorageError:
+        logger.warning(
+            "Failed to enable defense gid=%s uid=%s",
+            gid,
+            uid,
+            exc_info=True,
+        )
+        return web.json_response(
+            {"error": "防禦操作失敗：儲存服務暫時不可用"},
+            status=503,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to enable defense gid=%s uid=%s: %s", gid, uid, exc, exc_info=True)
+        return web.json_response(
+            {"error": "防禦操作失敗，請稍後重試"},
+            status=500,
+        )
 
 
 @_auth
@@ -743,7 +821,122 @@ async def _api_logs_post(req: web.Request) -> web.Response:
     return web.json_response({"message": "已新增維護日誌"})
 
 
-# ── SPA fallback ─────────────────────────────────────────
+# ── 開發者 API ──
+
+@_require_developer
+async def _api_dev_ratelimit_stats(req: web.Request) -> web.Response:
+    """取得 Rate-limit telemetry（只限開發者）。"""
+    try:
+        from mods.rate_limit import get_ratelimit_stats
+        minutes = int(req.query.get("minutes", "1"))
+        minutes = max(1, min(60, minutes))  # Clamp 1-60
+        stats = get_ratelimit_stats(minutes)
+        return web.json_response({
+            "success": True,
+            "stats": stats,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to get ratelimit stats: %s", exc, exc_info=True)
+        return web.json_response(
+            {"error": "無法取得統計", "detail": str(exc)},
+            status=500,
+        )
+
+
+@_require_developer
+async def _api_dev_system_stats(req: web.Request) -> web.Response:
+    """回傳系統/程序/Redis 資源使用狀況（只限開發者）。"""
+    global _net_prev
+    try:
+        # ── 系統 RAM ─────────────────────────────────────
+        vm = psutil.virtual_memory()
+        sys_ram_total_mb = vm.total / 1024 / 1024
+        sys_ram_used_mb = vm.used / 1024 / 1024
+        sys_ram_percent = vm.percent
+
+        # ── 系統 CPU ─────────────────────────────────────
+        sys_cpu_percent = psutil.cpu_percent(interval=None)
+
+        # ── 本程序資源 ──────────────────────────────────
+        proc_mem = _bot_proc.memory_info()
+        proc_ram_mb = proc_mem.rss / 1024 / 1024
+        proc_cpu = _bot_proc.cpu_percent(interval=None)
+
+        # ── 網路 I/O delta ──────────────────────────────
+        net_now = psutil.net_io_counters()
+        now_ts = time.time()
+        sent_ps = recv_ps = 0.0
+        if _net_prev:
+            dt = now_ts - _net_prev["ts"]
+            if dt > 0:
+                sent_ps = (net_now.bytes_sent - _net_prev["bytes_sent"]) / dt
+                recv_ps = (net_now.bytes_recv - _net_prev["bytes_recv"]) / dt
+        _net_prev = {
+            "bytes_sent": net_now.bytes_sent,
+            "bytes_recv": net_now.bytes_recv,
+            "ts": now_ts,
+        }
+
+        # ── Redis 記憶體 ────────────────────────────────
+        redis_info: dict = {}
+        try:
+            storage = get_storage()
+            if storage.redis_available and storage._redis:
+                raw = await storage._redis.info("memory")
+                used = raw.get("used_memory", 0)
+                maxmem = raw.get("maxmemory", 0)
+                redis_info = {
+                    "available": True,
+                    "used_memory_mb": round(used / 1024 / 1024, 2),
+                    "maxmemory_mb": round(maxmem / 1024 / 1024, 2) if maxmem else None,
+                    "used_memory_percent": round(used / maxmem * 100, 1) if maxmem else None,
+                    "used_memory_human": raw.get("used_memory_human"),
+                }
+            else:
+                redis_info = {"available": False}
+        except Exception as redis_exc:  # noqa: BLE001
+            redis_info = {"available": False, "error": str(redis_exc)}
+
+        return web.json_response({
+            "success": True,
+            "timestamp": now_ts,
+            "system": {
+                "cpu_percent": round(sys_cpu_percent, 1),
+                "ram_used_mb": round(sys_ram_used_mb, 1),
+                "ram_total_mb": round(sys_ram_total_mb, 1),
+                "ram_percent": round(sys_ram_percent, 1),
+            },
+            "process": {
+                "cpu_percent": round(proc_cpu, 1),
+                "ram_mb": round(proc_ram_mb, 1),
+            },
+            "network": {
+                "bytes_sent_per_s": round(sent_ps, 1),
+                "bytes_recv_per_s": round(recv_ps, 1),
+                "bytes_sent_total": net_now.bytes_sent,
+                "bytes_recv_total": net_now.bytes_recv,
+            },
+            "redis": redis_info,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to get system stats: %s", exc, exc_info=True)
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_developer
+async def _api_dev_info(req: web.Request) -> web.Response:
+    """回傳開發者模式資訊。"""
+    s = req["s"]
+    return web.json_response({
+        "success": True,
+        "user_id": s.get("id"),
+        "username": s.get("username"),
+        "is_developer": True,
+        "developer_ids": list(_DEVELOPER_IDS),
+    })
+
+
+# ── SPA fallback ────────────────────────────────────────
 
 async def _spa(req: web.Request) -> web.Response:
     """單頁應用程式入口回傳（前端路由 fallback）。"""
@@ -797,6 +990,11 @@ class WebCog(commands.Cog, name="Web"):
         r.add_post("/api/guilds/{gid}/defense/enable", _api_defense_enable)
         r.add_get("/api/guilds/{gid}/maintenance-logs", _api_logs_get)
         r.add_post("/api/guilds/{gid}/maintenance-logs", _api_logs_post)
+
+        # 開發者 API 路由。
+        r.add_get("/api/dev/ratelimit-stats", _api_dev_ratelimit_stats)
+        r.add_get("/api/dev/system-stats", _api_dev_system_stats)
+        r.add_get("/api/dev/info", _api_dev_info)
 
         # 前端靜態資源路由。
         static_dir = _WEB_DIR / "static"

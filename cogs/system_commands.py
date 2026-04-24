@@ -5,6 +5,7 @@
 - /status ：顯示 Redis / D1 連線與延遲
 - /panel  ：顯示管理面板網址
 - /defense：切換防禦系統啟停
+- /message-log-status：顯示訊息保留狀態
 """
 
 from time import perf_counter
@@ -16,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from mods.defense import (
+    DefenseStorageError,
     DEFAULT_DISABLE_SECONDS,
     get_defense_state,
     set_defense_disabled,
@@ -25,6 +27,9 @@ from mods.logger import setup_logger
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
+
+_MESSAGE_RETENTION_SECONDS = 14 * 24 * 60 * 60
+_MESSAGE_MAX_PER_GUILD = 50000
 
 
 class SystemCommandsCog(commands.Cog, name="SystemCommands"):
@@ -141,45 +146,148 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
         guild_id = str(guild.id)
         user_id = str(interaction.user.id)
 
-        if action.value == "disable":
-            state = await set_defense_disabled(
-                store,
-                guild_id,
-                user_id,
-                duration_seconds=DEFAULT_DISABLE_SECONDS,
-            )
+        try:
+            if action.value == "disable":
+                state = await set_defense_disabled(
+                    store,
+                    guild_id,
+                    user_id,
+                    duration_seconds=DEFAULT_DISABLE_SECONDS,
+                )
+                until = state["disabled_until"]
+                await interaction.followup.send(
+                    (
+                        "🛑 防禦系統已暫時關閉。\n"
+                        f"將於 <t:{until}:R> 自動恢復（<t:{until}:f>）。\n"
+                        "你也可以隨時用 `/defense` 選擇「立即啟用」。"
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if action.value == "enable":
+                await set_defense_enabled(store, guild_id, user_id)
+                await interaction.followup.send(
+                    "✅ 防禦系統已重新啟用。",
+                    ephemeral=True,
+                )
+                return
+
+            state = await get_defense_state(store, guild_id)
+            if state["enabled"]:
+                await interaction.followup.send("✅ 目前防禦系統為啟用中。", ephemeral=True)
+                return
+
             until = state["disabled_until"]
             await interaction.followup.send(
                 (
-                    "🛑 防禦系統已暫時關閉。\n"
-                    f"將於 <t:{until}:R> 自動恢復（<t:{until}:f>）。\n"
-                    "你也可以隨時用 `/defense` 選擇「立即啟用」。"
+                    "🛑 目前防禦系統為暫停中。\n"
+                    f"預計 <t:{until}:R> 自動恢復（<t:{until}:f>）。"
                 ),
                 ephemeral=True,
             )
-            return
-
-        if action.value == "enable":
-            await set_defense_enabled(store, guild_id, user_id)
+        except DefenseStorageError:
+            logger.warning(
+                "Defense command storage failed guild=%s action=%s user=%s",
+                guild_id,
+                action.value,
+                user_id,
+                exc_info=True,
+            )
             await interaction.followup.send(
-                "✅ 防禦系統已重新啟用。",
+                "❌ 防禦操作失敗：儲存服務暫時不可用，請稍後再試。",
                 ephemeral=True,
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Defense command failed guild=%s action=%s user=%s: %s",
+                guild_id,
+                action.value,
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            await interaction.followup.send(
+                "❌ 防禦操作失敗，請稍後重試。",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="message-log-status", description="查看訊息記錄保留狀態")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def message_log_status(self, interaction: discord.Interaction) -> None:
+        """顯示訊息記錄容量、14 天保留與是否超過上限。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("❌ 此指令只能在伺服器內使用。", ephemeral=True)
             return
 
-        state = await get_defense_state(store, guild_id)
-        if state["enabled"]:
-            await interaction.followup.send("✅ 目前防禦系統為啟用中。", ephemeral=True)
-            return
+        store = get_storage()
+        guild_id = str(guild.id)
 
-        until = state["disabled_until"]
-        await interaction.followup.send(
-            (
-                "🛑 目前防禦系統為暫停中。\n"
-                f"預計 <t:{until}:R> 自動恢復（<t:{until}:f>）。"
-            ),
-            ephemeral=True,
-        )
+        try:
+            total_rows = await store.fetchall(
+                "SELECT COUNT(*) AS cnt FROM encrypted_messages WHERE guild_id = ?",
+                [guild_id],
+            )
+            recent_rows = await store.fetchall(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM encrypted_messages
+                WHERE guild_id = ?
+                  AND timestamp >= (strftime('%s','now') - ?)
+                """,
+                [guild_id, _MESSAGE_RETENTION_SECONDS],
+            )
+            range_rows = await store.fetchall(
+                """
+                SELECT MIN(timestamp) AS oldest_ts, MAX(timestamp) AS newest_ts
+                FROM encrypted_messages
+                WHERE guild_id = ?
+                """,
+                [guild_id],
+            )
+
+            total = int(total_rows[0]["cnt"] if total_rows else 0)
+            in_retention = int(recent_rows[0]["cnt"] if recent_rows else 0)
+            overflow = max(0, total - _MESSAGE_MAX_PER_GUILD)
+            oldest_ts = int(range_rows[0]["oldest_ts"]) if range_rows and range_rows[0]["oldest_ts"] else None
+            newest_ts = int(range_rows[0]["newest_ts"]) if range_rows and range_rows[0]["newest_ts"] else None
+
+            embed = discord.Embed(title="訊息記錄狀態", color=discord.Color.blurple())
+            embed.add_field(name="總訊息數", value=f"{total}", inline=True)
+            embed.add_field(name="14 天內", value=f"{in_retention}", inline=True)
+            embed.add_field(name="超過上限 (50000)", value=f"{overflow}", inline=True)
+            embed.add_field(
+                name="保留規則",
+                value="僅保留 14 天內，且每伺服器最多 50000 則",
+                inline=False,
+            )
+            embed.add_field(
+                name="最早記錄",
+                value=(f"<t:{oldest_ts}:f>" if oldest_ts else "無"),
+                inline=True,
+            )
+            embed.add_field(
+                name="最新記錄",
+                value=(f"<t:{newest_ts}:f>" if newest_ts else "無"),
+                inline=True,
+            )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "message-log-status failed guild=%s: %s",
+                guild_id,
+                exc,
+                exc_info=True,
+            )
+            await interaction.followup.send(
+                "❌ 讀取訊息記錄狀態失敗，請稍後重試。",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="force-snapshot", description="立即重新快照伺服器頻道、身分組與成員暱稱")
     @app_commands.guild_only()

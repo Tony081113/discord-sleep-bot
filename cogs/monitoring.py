@@ -9,6 +9,7 @@
 import asyncio
 import datetime
 import json
+import logging
 import time
 from collections import defaultdict, deque
 from typing import Any, Optional
@@ -34,13 +35,21 @@ _MESSAGE_SPAM_WINDOW = 10  # seconds
 _MESSAGE_SPAM_COOLDOWN = 60  # seconds
 _BAN_OP_DELAY = 1.0  # seconds
 _ALERT_COOLDOWN_SECONDS = 120
-_SPAM_CLEANUP_LOOKBACK_SECONDS = 20
-_SPAM_CLEANUP_MAX_MESSAGES = 25
+_ATTACKER_NEUTRALIZE_COOLDOWN_SECONDS = 90
+_SPAM_CLEANUP_LOOKBACK_SECONDS = 60
+_SPAM_CLEANUP_MAX_MESSAGES = 200
 _SELF_ACTION_LOOKBACK_SECONDS = 30
+_ALERT_DM_CONCURRENCY = 2
+_MESSAGE_RETENTION_SECONDS = 14 * 24 * 60 * 60
+_MESSAGE_MAX_PER_GUILD = 50000
+_MESSAGE_CLEANUP_INTERVAL_SECONDS = 60
 
 _THRESHOLD: dict[str, int] = {
+    "channel_create": 8,
     "channel_delete": 3,
     "channel_update": 5,
+    "webhook_create": 3,
+    "role_create": 10,
     "role_delete": 3,
     "role_update": 5,
     "admin_perm_remove": 2,
@@ -48,15 +57,83 @@ _THRESHOLD: dict[str, int] = {
 }
 
 _AUDIT_ACTION_MAP: dict[str, discord.AuditLogAction] = {
+    "channel_create": discord.AuditLogAction.channel_create,
     "channel_delete": discord.AuditLogAction.channel_delete,
     "channel_update": discord.AuditLogAction.channel_update,
+    "webhook_create": discord.AuditLogAction.webhook_create,
+    "role_create": discord.AuditLogAction.role_create,
     "role_delete": discord.AuditLogAction.role_delete,
     "role_update": discord.AuditLogAction.role_update,
     "admin_perm_remove": discord.AuditLogAction.role_update,
 }
 
+_RELATED_AUDIT_ACTIONS: dict[str, tuple[discord.AuditLogAction, ...]] = {
+    # 頻道遭破壞時，常見分工是「一人刪除、一人狂建」，需合併掃描。
+    "channel_delete": (
+        discord.AuditLogAction.channel_delete,
+        discord.AuditLogAction.channel_create,
+        discord.AuditLogAction.channel_update,
+        discord.AuditLogAction.webhook_create,
+        discord.AuditLogAction.webhook_update,
+        discord.AuditLogAction.webhook_delete,
+        discord.AuditLogAction.role_create,
+        discord.AuditLogAction.role_delete,
+        discord.AuditLogAction.role_update,
+    ),
+    "channel_create": (
+        discord.AuditLogAction.channel_create,
+        discord.AuditLogAction.channel_delete,
+        discord.AuditLogAction.channel_update,
+        discord.AuditLogAction.webhook_create,
+        discord.AuditLogAction.webhook_update,
+        discord.AuditLogAction.webhook_delete,
+        discord.AuditLogAction.role_create,
+        discord.AuditLogAction.role_update,
+    ),
+    "webhook_create": (
+        discord.AuditLogAction.webhook_create,
+        discord.AuditLogAction.webhook_update,
+        discord.AuditLogAction.webhook_delete,
+        discord.AuditLogAction.channel_create,
+        discord.AuditLogAction.channel_delete,
+    ),
+    "role_delete": (
+        discord.AuditLogAction.role_delete,
+        discord.AuditLogAction.role_create,
+        discord.AuditLogAction.role_update,
+        discord.AuditLogAction.channel_delete,
+        discord.AuditLogAction.channel_create,
+    ),
+    "role_create": (
+        discord.AuditLogAction.role_create,
+        discord.AuditLogAction.role_delete,
+        discord.AuditLogAction.role_update,
+        discord.AuditLogAction.channel_create,
+        discord.AuditLogAction.channel_delete,
+    ),
+    "admin_perm_remove": (
+        discord.AuditLogAction.role_update,
+        discord.AuditLogAction.role_delete,
+        discord.AuditLogAction.role_create,
+    ),
+}
+
+_BROAD_AUDIT_ACTION_KEYWORDS: tuple[str, ...] = (
+    "channel_",
+    "role_",
+    "guild_update",
+    "overwrite_",
+    "webhook_",
+    "integration_",
+    "member_update",
+    "member_role_update",
+)
+
 _EVENT_LABELS: dict[str, str] = {
+    "channel_create": "大量頻道被建立",
     "channel_delete": "大量頻道被刪除",
+    "webhook_create": "大量 Webhook 被建立",
+    "role_create": "大量身分組被建立",
     "role_delete": "大量身分組被刪除",
     "admin_perm_remove": "管理員權限被移除",
     "channel_update": "大量頻道被修改",
@@ -140,25 +217,200 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self._message_windows: dict[tuple[int, int], deque[float]] = defaultdict(deque)
         # 觸發冷卻：避免同一使用者在短時間內重複觸發。
         self._spam_triggered_at: dict[tuple[int, int], float] = {}
-        # 告警鎖：避免同 guild/event 並發重複建立請求與連發通知。
-        self._alert_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # 告警冷卻：避免短時間內重複發送同類異常通知。
-        self._last_alert_at: dict[tuple[str, str], float] = {}
-        # 已發送的告警訊息 ID：(guild_id, event_type, user_id) -> message_id，用於編輯而非重發。
-        self._last_alert_msg_ids: dict[tuple[str, str, str], int] = {}
+        # 告警鎖：避免同 guild 並發重複建立請求與連發通知。
+        self._alert_locks: dict[str, asyncio.Lock] = {}
+        # 告警冷卻：避免短時間內重複發送同伺服器異常通知。
+        self._last_alert_at: dict[str, float] = {}
+        # 已發送的告警訊息 ID：(guild_id, user_id) -> message_id，用於編輯而非重發。
+        self._last_alert_msg_ids: dict[tuple[str, str], int] = {}
+        # 近期已處置的攻擊者，避免短時間重複執行相同封鎖流程。
+        self._neutralized_attackers_at: dict[tuple[str, int], float] = {}
+        # 近期已記錄的 webhook 建立事件，避免 on_webhooks_update 重複寫入。
+        self._recent_webhook_create_seen_at: dict[tuple[str, str], float] = {}
+        # 訊息清理節流，避免每則訊息都執行重型清理 SQL。
+        self._last_message_cleanup_at: dict[str, float] = {}
+
+    def _log_deferred(self, level: int, message: str, *args: Any) -> None:
+        """將高頻 log 延後到下一個 event-loop tick，避免塞住當前 async 熱路徑。"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(logger.log, level, message, *args)
+        except RuntimeError:
+            logger.log(level, message, *args)
+
+    async def _gather_bounded(self, coros: list, limit: int) -> list:
+        """以有界併發執行任務，提升吞吐同時控制速率。"""
+        if not coros:
+            return []
+        sem = asyncio.Semaphore(max(1, limit))
+
+        async def _runner(coro):
+            async with sem:
+                return await coro
+
+        return await asyncio.gather(*(_runner(c) for c in coros), return_exceptions=False)
 
     # ----------------------------------------------------------- on_message
+
+    def _sanitize_untrusted_text(self, value: str, *, max_len: int = 2000) -> str:
+        """清理不可信輸入，降低注入/格式破壞風險。"""
+        cleaned = value.replace("\x00", "").replace("\r", "")
+        if len(cleaned) > max_len:
+            cleaned = cleaned[:max_len]
+        return cleaned
+
+    def _extract_attachment_names(self, message: discord.Message) -> list[str]:
+        """提取附件檔名，不保存檔案本體。"""
+        names: list[str] = []
+        for att in message.attachments:
+            name = self._sanitize_untrusted_text(att.filename or "unknown", max_len=120)
+            if not name:
+                name = "unknown"
+            names.append(name)
+        return names
+
+    async def _insert_encrypted_message_compat(
+        self,
+        store,
+        *,
+        message_id: str,
+        channel_id: str,
+        guild_id: str,
+        author_id: str,
+        author_name: str,
+        author_avatar: str | None,
+        encrypted_content: str,
+        attachment_names_json: str,
+        nonce: str,
+    ) -> None:
+        """相容寫入 encrypted_messages。
+
+        優先使用 attachment_names 欄位；若資料庫尚未 migration，
+        會嘗試補上欄位並重試。最終仍失敗時回退到舊版欄位寫入，
+        以避免訊息遺失。
+        """
+        new_sql = (
+            """
+            INSERT OR IGNORE INTO encrypted_messages
+                (message_id, channel_id, guild_id, author_id,
+                 author_name, author_avatar, encrypted_content, attachment_names, nonce)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+        )
+        old_sql = (
+            """
+            INSERT OR IGNORE INTO encrypted_messages
+                (message_id, channel_id, guild_id, author_id,
+                 author_name, author_avatar, encrypted_content, nonce)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+        )
+        new_args = [
+            message_id,
+            channel_id,
+            guild_id,
+            author_id,
+            author_name,
+            author_avatar,
+            encrypted_content,
+            attachment_names_json,
+            nonce,
+        ]
+        old_args = [
+            message_id,
+            channel_id,
+            guild_id,
+            author_id,
+            author_name,
+            author_avatar,
+            encrypted_content,
+            nonce,
+        ]
+
+        try:
+            await store.execute(new_sql, new_args)
+            return
+        except Exception as exc:  # noqa: BLE001
+            exc_text = str(exc).lower()
+            missing_attachment_col = "no column named attachment_names" in exc_text
+            if not missing_attachment_col:
+                raise
+
+            logger.warning(
+                "encrypted_messages missing attachment_names; attempting runtime migration"
+            )
+
+            # 嘗試線上補 migration，成功後再重試新版 INSERT。
+            try:
+                await store.execute(
+                    "ALTER TABLE encrypted_messages ADD COLUMN attachment_names TEXT"
+                )
+                await store.execute(new_sql, new_args)
+                logger.info("Runtime migration applied: encrypted_messages.attachment_names")
+                return
+            except Exception:
+                # migration 可能已被其他執行緒套用，直接再試一次新版 INSERT。
+                try:
+                    await store.execute(new_sql, new_args)
+                    return
+                except Exception:
+                    # 最後回退舊 SQL，確保訊息仍可寫入。
+                    await store.execute(old_sql, old_args)
+                    logger.warning(
+                        "Stored message without attachment_names due to legacy schema"
+                    )
+
+    async def _cleanup_message_log_if_needed(self, store, guild_id: str) -> None:
+        """按節流執行訊息保留策略：14 天 + 每 guild 最多 50000 則。"""
+        now = time.time()
+        last = self._last_message_cleanup_at.get(guild_id, 0.0)
+        if (now - last) < _MESSAGE_CLEANUP_INTERVAL_SECONDS:
+            return
+        self._last_message_cleanup_at[guild_id] = now
+
+        try:
+            await store.execute(
+                "DELETE FROM encrypted_messages WHERE guild_id = ? AND timestamp < (strftime('%s','now') - ?)",
+                [guild_id, _MESSAGE_RETENTION_SECONDS],
+            )
+
+            await store.execute(
+                """
+                DELETE FROM encrypted_messages
+                WHERE message_id IN (
+                    SELECT message_id
+                    FROM encrypted_messages
+                    WHERE guild_id = ?
+                    ORDER BY timestamp DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                [guild_id, _MESSAGE_MAX_PER_GUILD],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Message retention cleanup failed guild=%s: %s",
+                guild_id,
+                exc,
+                exc_info=True,
+            )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """加密並保存所有非機器人的伺服器訊息。"""
-        if message.author.bot or message.guild is None:
+        is_webhook_message = message.webhook_id is not None
+        if message.guild is None:
+            return
+        if message.author.bot and not is_webhook_message:
             return
 
         store = get_storage()
         guild_id = str(message.guild.id)
-        if message.content:
-            encrypted_content, nonce = encrypt(message.content)
+        attachment_names = self._extract_attachment_names(message)
+        safe_content = self._sanitize_untrusted_text(message.content or "", max_len=4000)
+
+        if safe_content or attachment_names:
+            encrypted_content, nonce = encrypt(safe_content)
             avatar_url = (
                 message.author.display_avatar.url
                 if message.author.display_avatar
@@ -166,31 +418,151 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             )
 
             try:
-                await store.execute(
-                    """
-                    INSERT OR IGNORE INTO encrypted_messages
-                        (message_id, channel_id, guild_id, author_id,
-                         author_name, author_avatar, encrypted_content, nonce)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        str(message.id),
-                        str(message.channel.id),
-                        guild_id,
-                        str(message.author.id),
+                await self._insert_encrypted_message_compat(
+                    store,
+                    message_id=str(message.id),
+                    channel_id=str(message.channel.id),
+                    guild_id=guild_id,
+                    author_id=str(message.author.id),
+                    author_name=self._sanitize_untrusted_text(
                         message.author.display_name,
-                        avatar_url,
-                        encrypted_content,
-                        nonce,
-                    ],
+                        max_len=80,
+                    ),
+                    author_avatar=avatar_url,
+                    encrypted_content=encrypted_content,
+                    attachment_names_json=json.dumps(attachment_names, ensure_ascii=False),
+                    nonce=nonce,
                 )
+                await self._cleanup_message_log_if_needed(store, guild_id)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to store message %s: %s", message.id, exc)
 
         # 訊息保存後檢查是否命中轟炸門檻。
-        await self._detect_message_spam(message, store)
+        # 防禦流程任何例外都不應中斷 on_message 主事件。
+        try:
+            await self._detect_message_spam(message, store)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Spam detection pipeline failed guild=%s channel=%s message=%s: %s",
+                guild_id,
+                message.channel.id,
+                message.id,
+                exc,
+                exc_info=True,
+            )
+
+    @commands.Cog.listener()
+    async def on_webhooks_update(self, channel: discord.abc.GuildChannel) -> None:
+        """監聽 webhook 變更，將近期 webhook 建立行為記為異常事件。"""
+        guild = channel.guild
+        store = get_storage()
+        guild_id = str(guild.id)
+        now = time.time()
+        cutoff = now - _ANOMALY_WINDOW
+
+        stale_keys = [
+            key for key, ts in self._recent_webhook_create_seen_at.items() if ts < cutoff
+        ]
+        for key in stale_keys:
+            self._recent_webhook_create_seen_at.pop(key, None)
+
+        created = 0
+        try:
+            async for entry in guild.audit_logs(
+                limit=30,
+                action=discord.AuditLogAction.webhook_create,
+            ):
+                if entry.created_at.timestamp() < cutoff:
+                    break
+                if not entry.target:
+                    continue
+                target_id = str(getattr(entry.target, "id", ""))
+                if not target_id:
+                    continue
+                target_channel_id = str(getattr(entry.target, "channel_id", ""))
+                if target_channel_id and target_channel_id != str(channel.id):
+                    continue
+
+                seen_key = (guild_id, target_id)
+                if seen_key in self._recent_webhook_create_seen_at:
+                    continue
+                self._recent_webhook_create_seen_at[seen_key] = now
+
+                payload = {
+                    "webhook_id": target_id,
+                    "channel_id": str(channel.id),
+                    "channel_name": getattr(channel, "name", None),
+                    "executor_id": str(entry.user.id) if entry.user else None,
+                    "created_at": entry.created_at.isoformat() if entry.created_at else None,
+                }
+                await self._record_event(
+                    store,
+                    guild_id,
+                    "webhook_create",
+                    target_id,
+                    None,
+                    json.dumps(payload, ensure_ascii=False),
+                )
+                created += 1
+        except discord.Forbidden:
+            logger.warning("No audit log access for webhook updates guild=%s", guild_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed handling webhook update guild=%s channel=%s: %s",
+                guild_id,
+                channel.id,
+                exc,
+                exc_info=True,
+            )
+            return
+
+        if created > 0:
+            logger.warning(
+                "Webhook create burst detected guild=%s channel=%s created=%s",
+                guild_id,
+                channel.id,
+                created,
+            )
+            await self._check_and_alert(store, guild, "webhook_create")
 
     # ------------------------------------------------------ channel events
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(
+        self, channel: discord.abc.GuildChannel
+    ) -> None:
+        """記錄新建頻道事件，確保新建類別/頻道也有可還原快照。"""
+        guild_id = str(channel.guild.id)
+        store = get_storage()
+        new_data = json.dumps(_channel_to_dict(channel), ensure_ascii=False)
+
+        await self._record_event(
+            store, guild_id, "channel_create", str(channel.id), None, new_data,
+        )
+
+        await store.execute(
+            "INSERT INTO structure_snapshots "
+            "(guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+            [guild_id, "channel", str(channel.id), new_data],
+        )
+
+        await store.execute(
+            """
+            INSERT INTO channels (channel_id, guild_id, name, type, position, parent_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                name = excluded.name, type = excluded.type,
+                position = excluded.position, parent_id = excluded.parent_id
+            """,
+            [
+                str(channel.id), guild_id, channel.name,
+                channel.type.value, channel.position,
+                str(channel.category_id) if channel.category_id else None,
+            ],
+        )
+
+        await self._check_and_alert(store, channel.guild, "channel_create")
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(
@@ -281,6 +653,42 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
 
     # --------------------------------------------------------- role events
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role) -> None:
+        """記錄新建身分組事件，確保新建角色也有可還原快照。"""
+        guild_id = str(role.guild.id)
+        store = get_storage()
+        new_data = json.dumps(_role_to_dict(role), ensure_ascii=False)
+
+        await self._record_event(
+            store, guild_id, "role_create", str(role.id), None, new_data,
+        )
+
+        await store.execute(
+            "INSERT INTO structure_snapshots "
+            "(guild_id, target_type, target_id, snapshot_data) VALUES (?, ?, ?, ?)",
+            [guild_id, "role", str(role.id), new_data],
+        )
+
+        await store.execute(
+            """
+            INSERT INTO roles
+                (role_id, guild_id, name, permissions, position, color, hoist, mentionable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(role_id) DO UPDATE SET
+                name = excluded.name, permissions = excluded.permissions,
+                position = excluded.position, color = excluded.color,
+                hoist = excluded.hoist, mentionable = excluded.mentionable
+            """,
+            [
+                str(role.id), guild_id, role.name,
+                str(role.permissions.value), role.position,
+                role.color.value, int(role.hoist), int(role.mentionable),
+            ],
+        )
+
+        await self._check_and_alert(store, role.guild, "role_create")
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role) -> None:
@@ -406,6 +814,67 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 json.dumps({"user_id": str(after.id), "had_admin": False}, ensure_ascii=False),
             )
             await self._check_and_alert(store, after.guild, "admin_perm_remove")
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        """已知攻擊者（含機器人）重加時立即再次封鎖，避免在 pending 視窗內繞過防禦。"""
+        guild = member.guild
+        guild_id = str(guild.id)
+        store = get_storage()
+
+        try:
+            rows = await store.fetchall(
+                """
+                SELECT attacker_ids
+                FROM recovery_requests
+                WHERE guild_id = ?
+                  AND attacker_ids IS NOT NULL
+                  AND attacker_ids != ''
+                  AND created_at >= (strftime('%s', 'now') - 86400)
+                ORDER BY created_at DESC
+                LIMIT 30
+                """,
+                [guild_id],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to query attacker history guild=%s user=%s: %s",
+                guild_id,
+                member.id,
+                exc,
+            )
+            return
+
+        known_attackers: set[int] = set()
+        for row in rows:
+            raw = row.get("attacker_ids")
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                if str(item).isdigit():
+                    known_attackers.add(int(item))
+
+        if member.id not in known_attackers:
+            return
+
+        logger.warning(
+            "Known attacker rejoined guild=%s user=%s bot=%s; rebanning",
+            guild_id,
+            member.id,
+            member.bot,
+        )
+        await self._ban_user_ids(
+            guild=guild,
+            user_ids={member.id},
+            source_message_id=f"rejoin:{member.id}",
+            source_kind="member_join_known_attacker",
+        )
 
     @commands.Cog.listener()
     async def on_guild_update(
@@ -580,32 +1049,146 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             owners,
         )
 
+        # 立即在背景啟動釘快照 + 復原警報任務，不等待封鎖流程結束。
+        asyncio.create_task(
+            self._pin_and_alert_spam(store, guild),
+            name=f"spam_alert_{guild.id}",
+        )
+
         # 若 JSON 含 authorizing_integration_owners，視為 User Install 路徑：
-        # 先封 owner，再刪訊息；不要嘗試封鎖發訊者。
+        # 封 owner 與刪訊息並行。
         if owners:
-            await self._ban_authorizing_owner_ids(guild, owners, str(message.id))
-            await self._delete_detected_spam_message(message, source_kind="user_install")
-            await self._delete_recent_spam_messages(
-                message,
-                source_kind="user_install",
+            await asyncio.gather(
+                self._ban_authorizing_owner_ids(guild, owners, str(message.id)),
+                self._delete_recent_spam_messages(message, source_kind="user_install"),
             )
+            await self._delete_detected_spam_message(message, source_kind="user_install")
+        elif message.webhook_id is not None:
+            webhook_actor_ids = await self._find_webhook_operator_ids_from_audit(
+                guild,
+                str(message.webhook_id),
+            )
+            # 無論是否找到操作者，立即在背景刪除 webhook 本身以阻斷來源。
+            asyncio.create_task(
+                self._delete_spam_webhook(guild, str(message.webhook_id)),
+                name=f"del_webhook_{message.webhook_id}",
+            )
+            ban_coros: list = [
+                self._delete_recent_spam_messages(message, source_kind="webhook_message"),
+            ]
+            if webhook_actor_ids:
+                ban_coros.append(self._ban_user_ids(
+                    guild=guild,
+                    user_ids=webhook_actor_ids,
+                    source_message_id=str(message.id),
+                    source_kind="webhook_message_audit",
+                ))
+            else:
+                logger.warning(
+                    "Webhook spam found but no executor from audit guild=%s webhook_id=%s message=%s",
+                    guild.id,
+                    message.webhook_id,
+                    message.id,
+                )
+            await asyncio.gather(*ban_coros)
+            await self._delete_detected_spam_message(message, source_kind="webhook_message")
         else:
-            # 無 owner 資訊時，退回封鎖發訊者，再刪訊息。
-            await self._ban_user_ids(
-                guild=guild,
-                user_ids={message.author.id},
-                source_message_id=str(message.id),
-                source_kind="message_author_fallback",
+            # 無 owner 資訊時，封鎖發訊者與刪訊息並行。
+            await asyncio.gather(
+                self._ban_user_ids(
+                    guild=guild,
+                    user_ids={message.author.id},
+                    source_message_id=str(message.id),
+                    source_kind="message_author_fallback",
+                ),
+                self._delete_recent_spam_messages(message, source_kind="message_author"),
             )
             await self._delete_detected_spam_message(message, source_kind="message_author")
-            await self._delete_recent_spam_messages(
-                message,
-                source_kind="message_author",
+
+    async def _pin_and_alert_spam(self, store, guild: discord.Guild) -> None:
+        """背景任務：釘住攻擊前快照並發送復原警報。"""
+        try:
+            await self._pin_pre_attack_snapshots(store, str(guild.id))
+            await self._check_and_alert(store, guild, "message_spam")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "pin_and_alert_spam failed guild=%s: %s", guild.id, exc, exc_info=True
             )
 
-        # 釘住快照並建立復原請求（與其他事件類型統一流程）。
-        await self._pin_pre_attack_snapshots(store, str(guild.id))
-        await self._check_and_alert(store, guild, "message_spam")
+    async def _delete_spam_webhook(self, guild: discord.Guild, webhook_id: str) -> None:
+        """背景任務：刪除垃圾 webhook，阻斷訊息來源。"""
+        try:
+            webhook = await rate_limited_call(
+                self.bot.fetch_webhook,
+                int(webhook_id),
+                limit_key="webhook_fetch",
+            )
+            await rate_limited_call(
+                webhook.delete,
+                reason="Spam webhook — deleted by defense system",
+                limit_key="webhook_ops",
+            )
+            logger.warning(
+                "Deleted spam webhook guild=%s webhook_id=%s", guild.id, webhook_id
+            )
+        except discord.NotFound:
+            logger.info(
+                "Spam webhook already gone guild=%s webhook_id=%s", guild.id, webhook_id
+            )
+        except discord.Forbidden:
+            logger.error(
+                "Cannot delete webhook guild=%s webhook_id=%s (no permission)",
+                guild.id, webhook_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to delete webhook guild=%s webhook_id=%s: %s",
+                guild.id, webhook_id, exc, exc_info=True,
+            )
+
+    async def _find_webhook_operator_ids_from_audit(
+        self,
+        guild: discord.Guild,
+        webhook_id: str,
+    ) -> set[int]:
+        """從 webhook 相關稽核事件找出操作者 user ID。"""
+        attacker_ids: set[int] = set()
+        cutoff = time.time() - _ANOMALY_WINDOW
+        for action in (
+            discord.AuditLogAction.webhook_create,
+            discord.AuditLogAction.webhook_update,
+            discord.AuditLogAction.webhook_delete,
+        ):
+            try:
+                async for entry in guild.audit_logs(limit=100, action=action):
+                    if entry.created_at.timestamp() < cutoff:
+                        break
+                    target = getattr(entry, "target", None)
+                    target_id = str(getattr(target, "id", ""))
+                    if target_id and target_id != webhook_id:
+                        continue
+                    if entry.user and entry.user.id != (self.bot.user.id if self.bot.user else None):
+                        attacker_ids.add(entry.user.id)
+            except discord.Forbidden:
+                logger.warning(
+                    "No audit log access for webhook operators guild=%s", guild.id
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to resolve webhook operators guild=%s webhook=%s action=%s: %s",
+                    guild.id,
+                    webhook_id,
+                    action,
+                    exc,
+                )
+        logger.debug(
+            "Webhook operator scan guild=%s webhook=%s attackers=%s",
+            guild.id,
+            webhook_id,
+            sorted(attacker_ids),
+        )
+        return attacker_ids
 
     async def _delete_detected_spam_message(
         self,
@@ -614,10 +1197,14 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
     ) -> None:
         """刪除命中轟炸偵測的訊息。"""
         try:
-            await rate_limited_call(
-                message.delete,
-                reason=f"Message spam detected ({source_kind})",
-            )
+            try:
+                await rate_limited_call(
+                    message.delete,
+                    reason=f"Message spam detected ({source_kind})",
+                )
+            except TypeError:
+                # 某些訊息物件（如 PartialMessage）delete 不接受 reason 參數。
+                await rate_limited_call(message.delete)
             logger.warning(
                 "Deleted spam message guild=%s channel=%s message=%s source=%s",
                 message.guild.id if message.guild else "unknown",
@@ -655,7 +1242,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         message: discord.Message,
         source_kind: str,
     ) -> None:
-        """刪除同一波 recent spam 訊息（同頻道、同作者）。"""
+        """刪除同一波 recent spam 訊息（channel.purge 批次刪除）。"""
         channel = message.channel
         if not isinstance(channel, discord.TextChannel):
             return
@@ -663,55 +1250,49 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         cutoff = discord.utils.utcnow() - datetime.timedelta(
             seconds=_SPAM_CLEANUP_LOOKBACK_SECONDS
         )
-        deleted = 0
+        author_id = message.author.id
+        webhook_id = message.webhook_id
+
+        def _is_spam(m: discord.Message) -> bool:
+            if m.id == message.id:
+                return False
+            if webhook_id is not None and m.webhook_id == webhook_id:
+                return True
+            return m.author.id == author_id
 
         try:
-            async for item in channel.history(limit=100, after=cutoff):
-                if deleted >= _SPAM_CLEANUP_MAX_MESSAGES:
-                    break
-                if item.id == message.id:
-                    continue
-                if item.author.id != message.author.id:
-                    continue
-                try:
-                    await rate_limited_call(
-                        item.delete,
-                        reason=f"Recent spam cleanup ({source_kind})",
-                    )
-                    deleted += 1
-                    await asyncio.sleep(0.25)
-                except discord.NotFound:
-                    continue
-                except discord.Forbidden:
-                    logger.error(
-                        "Recent spam cleanup forbidden channel=%s source=%s",
-                        channel.id,
-                        source_kind,
-                    )
-                    break
-                except discord.HTTPException as exc:
-                    logger.warning(
-                        "Recent spam cleanup failed channel=%s msg=%s source=%s: %s",
-                        channel.id,
-                        item.id,
-                        source_kind,
-                        exc,
-                    )
+            deleted = await channel.purge(
+                limit=_SPAM_CLEANUP_MAX_MESSAGES,
+                check=_is_spam,
+                after=cutoff,
+                reason=f"Spam cleanup ({source_kind})",
+                bulk=True,
+            )
             if deleted:
                 logger.warning(
-                    "Recent spam cleanup done guild=%s channel=%s deleted=%s source=%s",
-                    message.guild.id if message.guild else "unknown",
+                    "Spam cleanup deleted=%s channel=%s guild=%s source=%s",
+                    len(deleted),
                     channel.id,
-                    deleted,
+                    message.guild.id if message.guild else "unknown",
                     source_kind,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except discord.Forbidden:
             logger.error(
-                "Recent spam cleanup crashed channel=%s source=%s: %s",
+                "Spam cleanup forbidden channel=%s source=%s",
+                channel.id,
+                source_kind,
+            )
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Spam cleanup failed channel=%s source=%s: %s",
                 channel.id,
                 source_kind,
                 exc,
-                exc_info=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Spam cleanup crashed channel=%s source=%s: %s",
+                channel.id, source_kind, exc, exc_info=True,
             )
 
     async def _ban_authorizing_owner_ids(
@@ -762,7 +1343,11 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     continue
 
                 # 僅處理可解析為 Discord 使用者的 ID。
-                await rate_limited_call(self.bot.fetch_user, user_id)
+                await rate_limited_call(
+                    self.bot.fetch_user,
+                    user_id,
+                    limit_key="user_fetch",
+                )
 
                 member = guild.get_member(user_id)
                 if member:
@@ -773,6 +1358,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                             member.edit,
                             roles=safe_roles,
                             reason=f"Attack detected — stripping roles ({source_kind})",
+                            limit_key="member_ops",
                         )
                         logger.info(
                             "Stripped roles guild=%s user=%s source=%s",
@@ -785,11 +1371,16 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         )
                     # 2. 靜音（timeout 最長 28 天）
                     try:
-                        until = discord.utils.utcnow() + datetime.timedelta(days=28)
+                        # Discord 對 timeout 時間戳很嚴格：採保守值並去除微秒。
+                        until = (
+                            datetime.datetime.now(datetime.timezone.utc)
+                            + datetime.timedelta(days=27, hours=23, minutes=50)
+                        ).replace(microsecond=0)
                         await rate_limited_call(
                             member.edit,
                             timed_out_until=until,
                             reason=f"Attack detected — muted pending ban ({source_kind})",
+                            limit_key="member_ops",
                         )
                         logger.info(
                             "Timed out guild=%s user=%s source=%s",
@@ -810,6 +1401,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         f"Attack detected; banned by {source_kind} "
                         f"(source_message_id={source_message_id})"
                     ),
+                    limit_key="guild_ban",
                 )
                 logger.warning(
                     "Banned user from %s guild=%s user=%s source_message=%s",
@@ -846,26 +1438,97 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
     async def _find_attackers_from_audit(
         self, guild: discord.Guild, event_type: str
     ) -> set[int]:
-        """從稽核紀錄找出近 _ANOMALY_WINDOW 秒內執行異常操作的使用者 ID。"""
-        action = _AUDIT_ACTION_MAP.get(event_type)
-        if not action:
+        """從近 _ANOMALY_WINDOW 秒內的相關稽核動作聚合攻擊者 ID。"""
+        primary_action = _AUDIT_ACTION_MAP.get(event_type)
+        actions = _RELATED_AUDIT_ACTIONS.get(event_type)
+        if not actions and primary_action:
+            actions = (primary_action,)
+        if not actions:
             return set()
+
         attacker_ids: set[int] = set()
+        scanned_entries_by_action: dict[str, int] = {}
+        scanned_users_by_action: dict[str, list[int]] = {}
         cutoff = time.time() - _ANOMALY_WINDOW
-        try:
-            async for entry in guild.audit_logs(limit=50, action=action):
-                if entry.created_at.timestamp() < cutoff:
-                    break
-                if entry.user and entry.user.id != (self.bot.user.id if self.bot.user else None):
-                    attacker_ids.add(entry.user.id)
-        except discord.Forbidden:
-            logger.warning(
-                "No audit log access guild=%s event=%s", guild.id, event_type
+
+        for action in actions:
+            scanned_users: set[int] = set()
+            scanned_entries = 0
+            try:
+                async for entry in guild.audit_logs(limit=100, action=action):
+                    scanned_entries += 1
+                    if entry.created_at.timestamp() < cutoff:
+                        break
+                    if entry.user:
+                        scanned_users.add(entry.user.id)
+                        if entry.user.id != (self.bot.user.id if self.bot.user else None):
+                            attacker_ids.add(entry.user.id)
+            except discord.Forbidden:
+                logger.warning(
+                    "No audit log access guild=%s event=%s action=%s",
+                    guild.id,
+                    event_type,
+                    action,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Audit log fetch failed guild=%s event=%s action=%s: %s",
+                    guild.id,
+                    event_type,
+                    action,
+                    exc,
+                )
+            scanned_entries_by_action[str(action)] = scanned_entries
+            scanned_users_by_action[str(action)] = sorted(scanned_users)
+
+        if len(attacker_ids) <= 1:
+            fallback_users: set[int] = set()
+            fallback_entries = 0
+            try:
+                async for entry in guild.audit_logs(limit=200):
+                    fallback_entries += 1
+                    if entry.created_at.timestamp() < cutoff:
+                        break
+                    if not entry.user:
+                        continue
+                    if entry.user.id == (self.bot.user.id if self.bot.user else None):
+                        continue
+                    if self._is_suspicious_audit_action(entry.action):
+                        fallback_users.add(entry.user.id)
+            except discord.Forbidden:
+                logger.warning(
+                    "No broad audit log access guild=%s event=%s",
+                    guild.id,
+                    event_type,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Broad audit scan failed guild=%s event=%s: %s",
+                    guild.id,
+                    event_type,
+                    exc,
+                )
+
+            if fallback_users:
+                attacker_ids.update(fallback_users)
+            logger.debug(
+                "Broad audit fallback guild=%s event=%s entries=%s users=%s merged_attackers=%s",
+                guild.id,
+                event_type,
+                fallback_entries,
+                sorted(fallback_users),
+                sorted(attacker_ids),
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Audit log fetch failed guild=%s event=%s: %s", guild.id, event_type, exc
-            )
+
+        logger.debug(
+            "Audit scan guild=%s event=%s actions=%s entries=%s users=%s attackers=%s",
+            guild.id,
+            event_type,
+            [str(a) for a in actions],
+            scanned_entries_by_action,
+            scanned_users_by_action,
+            sorted(attacker_ids),
+        )
         return attacker_ids
 
     async def _is_bot_initiated_action(
@@ -893,6 +1556,23 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         except Exception:
             return False
 
+    def _is_suspicious_audit_action(self, action: Any) -> bool:
+        """判斷 audit action 是否屬於高風險管理行為。"""
+        action_text = str(action)
+        return any(keyword in action_text for keyword in _BROAD_AUDIT_ACTION_KEYWORDS)
+
+    def _should_skip_recently_neutralized(
+        self,
+        guild_id: str,
+        user_id: int,
+        now: float,
+    ) -> bool:
+        """短時間內重複命中同一攻擊者時，避免重複處置。"""
+        key = (guild_id, user_id)
+        last = self._neutralized_attackers_at.get(key, 0.0)
+        if (now - last) < _ATTACKER_NEUTRALIZE_COOLDOWN_SECONDS:
+            return True
+        self._neutralized_attackers_at[key] = now
         return False
 
     async def _pin_pre_attack_snapshots(
@@ -998,6 +1678,39 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
         return threshold
 
+    async def _get_recent_event_summary(
+        self, store, guild_id: str
+    ) -> dict[str, int]:
+        """彙總近 _ANOMALY_WINDOW 秒內各異常事件數量。"""
+        try:
+            rows = await store.fetchall(
+                """
+                SELECT event_type, COUNT(*) AS cnt
+                FROM temp_cache
+                WHERE guild_id = ?
+                  AND timestamp >= (strftime('%s', 'now') - ?)
+                GROUP BY event_type
+                """,
+                [guild_id, _ANOMALY_WINDOW],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to build event summary guild=%s: %s",
+                guild_id,
+                exc,
+                exc_info=True,
+            )
+            return {}
+
+        summary: dict[str, int] = {}
+        for row in rows:
+            ev = row.get("event_type")
+            cnt = int(row.get("cnt") or 0)
+            if not ev or cnt <= 0:
+                continue
+            summary[str(ev)] = cnt
+        return summary
+
     async def _check_and_alert(
         self, store, guild: discord.Guild, event_type: str
     ) -> None:
@@ -1015,7 +1728,8 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
 
         threshold = await self._get_threshold(store, guild_id, event_type)
 
-        logger.info(
+        self._log_deferred(
+            logging.DEBUG,
             "Checking anomaly guild=%s name=%s event=%s threshold=%s window=%s",
             guild_id,
             guild.name,
@@ -1024,7 +1738,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             _ANOMALY_WINDOW,
         )
 
-        lock_key = (guild_id, event_type)
+        lock_key = guild_id
         lock = self._alert_locks.get(lock_key)
         if lock is None:
             lock = asyncio.Lock()
@@ -1051,7 +1765,8 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 )
                 return
 
-            logger.info(
+            self._log_deferred(
+                logging.DEBUG,
                 "Anomaly count guild=%s event=%s count=%s threshold=%s",
                 guild_id,
                 event_type,
@@ -1060,7 +1775,8 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             )
 
             if count < threshold:
-                logger.info(
+                self._log_deferred(
+                    logging.DEBUG,
                     "Anomaly not triggered guild=%s event=%s count=%s threshold=%s",
                     guild_id,
                     event_type,
@@ -1074,54 +1790,53 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 guild_id, event_type, count, threshold,
             )
 
-            now = time.time()
-            last_alert = self._last_alert_at.get(lock_key, 0.0)
-            if (now - last_alert) < _ALERT_COOLDOWN_SECONDS:
-                logger.debug(
-                    "Anomaly alert throttled guild=%s event=%s since_last=%.1fs cooldown=%ss",
-                    guild_id,
-                    event_type,
-                    now - last_alert,
-                    _ALERT_COOLDOWN_SECONDS,
-                )
-                return
-
-            # 若尚無待處理請求，建立新的 recovery request。
+            # 每個伺服器同時間只允許一筆 pending 請求，避免不同事件類型重複告警。
             request_id = None
+            existing_pending_request = False
             try:
                 existing = await store.fetchall(
                     "SELECT id FROM recovery_requests "
-                    "WHERE guild_id = ? AND event_type = ? AND status = 'pending'",
-                    [guild_id, event_type],
+                    "WHERE guild_id = ? AND status = 'pending' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [guild_id],
                 )
                 if existing:
+                    pending_id = existing[0]["id"]
+                    existing_pending_request = True
+                    await store.execute(
+                        "UPDATE recovery_requests "
+                        "SET event_count = CASE WHEN event_count > ? THEN event_count ELSE ? END "
+                        "WHERE id = ? AND guild_id = ?",
+                        [count, count, pending_id, guild_id],
+                    )
+                    request_id = pending_id
                     logger.info(
                         "Pending recovery request already exists guild=%s event=%s request_id=%s",
                         guild_id,
                         event_type,
-                        existing[0]["id"],
+                        pending_id,
                     )
-                    return  # 同類異常已有待處理請求，避免重複通知。
-                await store.execute(
-                    "INSERT INTO recovery_requests (guild_id, event_type, event_count) "
-                    "VALUES (?, ?, ?)",
-                    [guild_id, event_type, count],
-                )
-                row = await store.fetchall(
-                    "SELECT id FROM recovery_requests "
-                    "WHERE guild_id = ? AND event_type = ? AND status = 'pending' "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    [guild_id, event_type],
-                )
-                if row:
-                    request_id = row[0]["id"]
-                    logger.info(
-                        "Created recovery request guild=%s event=%s request_id=%s count=%s",
-                        guild_id,
-                        event_type,
-                        request_id,
-                        count,
+                else:
+                    await store.execute(
+                        "INSERT INTO recovery_requests (guild_id, event_type, event_count) "
+                        "VALUES (?, ?, ?)",
+                        [guild_id, event_type, count],
                     )
+                    row = await store.fetchall(
+                        "SELECT id FROM recovery_requests "
+                        "WHERE guild_id = ? AND status = 'pending' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        [guild_id],
+                    )
+                    if row:
+                        request_id = row[0]["id"]
+                        logger.info(
+                            "Created recovery request guild=%s event=%s request_id=%s count=%s",
+                            guild_id,
+                            event_type,
+                            request_id,
+                            count,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Failed to create recovery request guild=%s event=%s count=%s: %s",
@@ -1133,7 +1848,14 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                 )
                 return
 
-            self._last_alert_at[lock_key] = now
+            if existing_pending_request:
+                logger.debug(
+                    "Pending request exists; skip repeated alert/request guild=%s event=%s pending_request=%s",
+                    guild_id,
+                    event_type,
+                    request_id,
+                )
+
             # 非 message_spam 事件透過稽核紀錄找出攻擊者並立即處置。
             # message_spam 攻擊者已在 _handle_message_spam_detected 中處理。
             if event_type != "message_spam":
@@ -1154,7 +1876,18 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                             logger.error(
                                 "Failed to save attacker_ids request_id=%s: %s", request_id, exc
                             )
+                    ban_now = time.time()
                     for uid in attacker_ids:
+                        member = guild.get_member(uid)
+                        # 對仍在場的機器人攻擊者不使用冷卻，避免快速重加造成防禦空窗。
+                        if not (member and member.bot) and self._should_skip_recently_neutralized(guild_id, uid, ban_now):
+                            logger.debug(
+                                "Skip recently neutralized attacker guild=%s event=%s user=%s",
+                                guild_id,
+                                event_type,
+                                uid,
+                            )
+                            continue
                         await self._ban_user_ids(
                             guild=guild,
                             user_ids={uid},
@@ -1162,14 +1895,41 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                             source_kind=f"anomaly:{event_type}",
                         )
 
+            # 有 pending 請求時，避免重複建立請求與重複告警；
+            # 但上面的攻擊者辨識與封鎖仍會執行。
+            if existing_pending_request:
+                return
+
+            now = time.time()
+            last_alert = self._last_alert_at.get(lock_key, 0.0)
+            if (now - last_alert) < _ALERT_COOLDOWN_SECONDS:
+                logger.debug(
+                    "Anomaly alert throttled guild=%s event=%s since_last=%.1fs cooldown=%ss",
+                    guild_id,
+                    event_type,
+                    now - last_alert,
+                    _ALERT_COOLDOWN_SECONDS,
+                )
+                return
+            self._last_alert_at[lock_key] = now
+
             # 釘住攻擊前快照，防止守護程式擠掉可還原資料。
             await self._pin_pre_attack_snapshots(store, guild_id)
 
-            await self._alert_approvers(store, guild, event_type, count, request_id)
+            event_summary = await self._get_recent_event_summary(store, guild_id)
+            await self._alert_approvers(
+                store,
+                guild,
+                event_type,
+                count,
+                request_id,
+                event_summary,
+            )
 
     async def _alert_approvers(
         self, store, guild: discord.Guild, event_type: str, count: int,
         request_id: int | None = None,
+        event_summary: dict[str, int] | None = None,
     ) -> None:
         """將異常警報透過私訊發給核准者，附上一鍵復原按鈕。"""
         guild_id = str(guild.id)
@@ -1208,12 +1968,20 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         )
 
         label = _EVENT_LABELS.get(event_type, event_type)
+        summary = event_summary or {}
+        summary_lines: list[str] = []
+        for ev, ev_count in sorted(summary.items(), key=lambda item: item[1], reverse=True):
+            ev_label = _EVENT_LABELS.get(ev, ev)
+            summary_lines.append(f"- {ev_label}: {ev_count}")
+        summary_text = "\n".join(summary_lines) if summary_lines else "- 無可用摘要"
+
         embed = discord.Embed(
             title="\U0001f6a8 伺服器異常警報",
             description=(
                 f"**{guild.name}** 偵測到異常活動：\n\n"
                 f"\U0001f4cb 類型：**{label}**\n"
                 f"\U0001f4ca 5 分鐘內事件數：**{count}**\n\n"
+                f"\U0001f4dd 伺服器異常摘要（5 分鐘）：\n{summary_text}\n\n"
                 f"如需將伺服器復原至 5 分鐘前的狀態，請點擊下方按鈕。"
             ),
             color=discord.Color.red(),
@@ -1247,14 +2015,17 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         view.add_item(recovery_btn)
         view.add_item(decline_btn)
 
-        sent = 0
         alert_msg_ids: dict[str, int] = {}
-        for row in approvers:
+        async def _send_one_alert(row: dict[str, Any]) -> tuple[int, str | None, int | None]:
             user_id = row["user_id"]
             user = self.bot.get_user(int(row["user_id"]))
             if user is None:
                 try:
-                    user = await rate_limited_call(self.bot.fetch_user, int(row["user_id"]))
+                    user = await rate_limited_call(
+                        self.bot.fetch_user,
+                        int(row["user_id"]),
+                        limit_key="user_fetch",
+                    )
                 except discord.NotFound:
                     logger.warning(
                         "Approver user not found guild=%s approver=%s event=%s request_id=%s",
@@ -1263,9 +2034,9 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         event_type,
                         request_id,
                     )
-                    continue
+                    return (0, None, None)
             try:
-                msg_key = (guild_id, event_type, user_id)
+                msg_key = (guild_id, user_id)
                 prev_msg_id = self._last_alert_msg_ids.get(msg_key)
                 edited = False
                 if prev_msg_id:
@@ -1274,7 +2045,6 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         prev_msg = await dm.fetch_message(prev_msg_id)
                         await rate_limited_call(prev_msg.edit, embed=embed, view=view)
                         edited = True
-                        alert_msg_ids[user_id] = prev_msg_id
                         logger.info(
                             "Edited existing alert msg guild=%s approver=%s event=%s request_id=%s",
                             guild_id, user_id, event_type, request_id,
@@ -1282,9 +2052,13 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                         pass  # 訊息已消失，改為重新發送
                 if not edited:
-                    msg = await rate_limited_call(user.send, embed=embed, view=view)
+                    msg = await rate_limited_call(
+                        user.send,
+                        embed=embed,
+                        view=view,
+                        limit_key="dm_send",
+                    )
                     self._last_alert_msg_ids[msg_key] = msg.id
-                    alert_msg_ids[user_id] = msg.id
                     logger.info(
                         "Sent anomaly alert guild=%s approver=%s event=%s request_id=%s",
                         guild_id,
@@ -1292,8 +2066,10 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         event_type,
                         request_id,
                     )
-                    await dm_sleep()
-                sent += 1
+                    await asyncio.sleep(DM_SEND_DELAY)
+                    return (1, user_id, msg.id)
+
+                return (1, user_id, prev_msg_id)
             except discord.Forbidden:
                 logger.warning(
                     "Cannot DM approver guild=%s approver=%s event=%s request_id=%s",
@@ -1302,6 +2078,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     event_type,
                     request_id,
                 )
+                return (0, None, None)
             except discord.HTTPException as exc:
                 logger.warning(
                     "Failed DM approver guild=%s approver=%s event=%s request_id=%s: %s",
@@ -1312,6 +2089,17 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     exc,
                     exc_info=True,
                 )
+                return (0, None, None)
+
+        results = await self._gather_bounded(
+            [_send_one_alert(row) for row in approvers],
+            _ALERT_DM_CONCURRENCY,
+        )
+        sent = 0
+        for sent_one, uid, mid in results:
+            sent += sent_one
+            if uid and mid:
+                alert_msg_ids[uid] = mid
 
         # 將訊息 ID 存入 DB 供 RecoveryCog 後續編輯用。
         if request_id and alert_msg_ids:
