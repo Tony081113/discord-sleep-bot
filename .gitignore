@@ -209,3 +209,8 @@ marimo/_lsp/
 __marimo__/
 test/test.env
 test/test_bot.py
+
+# Local runtime artifacts
+output.txt
+recovery_resume_queue.json
+storage.db

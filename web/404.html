@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SleepBot - 404</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=20260418-2">
+  <link rel="icon" href="/static/favicon.svg">
+  <style>
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(ellipse at 18% 28%, rgba(139, 126, 200, 0.16) 0%, transparent 45%),
+        radial-gradient(ellipse at 82% 18%, rgba(78, 205, 196, 0.12) 0%, transparent 42%),
+        var(--bg-0);
+      color: var(--text-1);
+      padding: 20px;
+    }
+
+    .nf-card {
+      width: min(640px, 100%);
+      background: linear-gradient(160deg, rgba(19, 27, 46, 0.96), rgba(13, 19, 33, 0.96));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-card), var(--shadow-glow);
+      padding: 36px 30px;
+      text-align: center;
+      animation: nf-rise 0.45s ease-out;
+    }
+
+    .nf-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      color: var(--text-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      margin-bottom: 16px;
+      background: rgba(8, 12, 20, 0.65);
+    }
+
+    .nf-code {
+      font-family: var(--font-mono);
+      font-size: clamp(58px, 16vw, 104px);
+      line-height: 0.95;
+      margin: 0;
+      background: linear-gradient(135deg, var(--purple) 0%, var(--teal) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .nf-title {
+      margin-top: 14px;
+      font-size: clamp(24px, 5vw, 34px);
+      line-height: 1.2;
+    }
+
+    .nf-desc {
+      color: var(--text-2);
+      font-size: 15px;
+      margin: 12px auto 26px;
+      max-width: 42ch;
+    }
+
+    .nf-actions {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .nf-btn {
+      border-radius: var(--radius-sm);
+      font-weight: 600;
+      font-size: 14px;
+      border: 1px solid transparent;
+      padding: 10px 16px;
+      cursor: pointer;
+      transition: all var(--transition);
+      text-decoration: none;
+    }
+
+    .nf-btn.primary {
+      background: linear-gradient(135deg, var(--purple) 0%, var(--teal) 100%);
+      color: #0a0f1c;
+      box-shadow: 0 6px 20px rgba(78, 205, 196, 0.18);
+    }
+
+    .nf-btn.primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(78, 205, 196, 0.24);
+      text-decoration: none;
+    }
+
+    .nf-btn.ghost {
+      background: var(--bg-2);
+      color: var(--text-1);
+      border-color: var(--border);
+    }
+
+    .nf-btn.ghost:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-active);
+    }
+
+    @keyframes nf-rise {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 520px) {
+      .nf-card {
+        padding: 28px 20px;
+      }
+      .nf-actions {
+        flex-direction: column;
+      }
+      .nf-btn {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="nf-card" role="main" aria-labelledby="nf-title">
+    <div class="nf-badge">SLEEPBOT CONTROL PANEL</div>
+    <h1 class="nf-code">404</h1>
+    <h2 id="nf-title" class="nf-title">找不到這個頁面</h2>
+    <p class="nf-desc">
+      你剛剛造訪的路徑不存在，或是沒有對應的資源可提供。
+    </p>
+    <div class="nf-actions">
+      <a href="/" class="nf-btn primary">回到主控台</a>
+      <button class="nf-btn ghost" type="button" onclick="history.back()">返回上一頁</button>
+    </div>
+  </main>
+</body>
+</html>

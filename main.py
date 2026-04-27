@@ -38,7 +38,62 @@ INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
 
-bot = commands.Bot(command_prefix=">>", intents=INTENTS)
+_RECOVERY_SHUTDOWN_WAIT_SECONDS = max(
+    0,
+    int(os.getenv("RECOVERY_SHUTDOWN_WAIT_SECONDS", "180")),
+)
+
+
+async def _wait_or_queue_recoveries_before_shutdown(bot: commands.Bot) -> None:
+    """關機前先等復原任務；逾時未完成則排到下次開機。"""
+    recovery_cog = bot.get_cog("Recovery")
+    if recovery_cog is None:
+        return
+    if not hasattr(recovery_cog, "wait_for_all_recoveries"):
+        return
+
+    completed, active = await recovery_cog.wait_for_all_recoveries(
+        _RECOVERY_SHUTDOWN_WAIT_SECONDS
+    )
+    if completed:
+        logger.info("Shutdown wait: all recovery tasks completed")
+        return
+
+    if not active:
+        return
+
+    queued_total = 0
+    if hasattr(recovery_cog, "persist_recovery_resume_queue"):
+        queued_total = recovery_cog.persist_recovery_resume_queue(active)
+    logger.warning(
+        "Shutdown timeout: %d recovery task(s) queued for next startup (queue_size=%d)",
+        len(active),
+        queued_total,
+    )
+
+
+class SleepBot(commands.Bot):
+    """Bot with graceful shutdown that coordinates recovery workflows."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._closing_with_recovery_wait = False
+
+    async def close(self) -> None:
+        if self._closing_with_recovery_wait:
+            await super().close()
+            return
+
+        self._closing_with_recovery_wait = True
+        try:
+            await _wait_or_queue_recoveries_before_shutdown(self)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Graceful recovery shutdown check failed: %s", exc, exc_info=True)
+        finally:
+            await super().close()
+
+
+bot = SleepBot(command_prefix=">>", intents=INTENTS)
 _app_commands_synced = False
 
 
@@ -228,14 +283,76 @@ async def cmd_commit(ctx: commands.Context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+
+_reload_task: asyncio.Task | None = None
+
+
+async def monitor_reload_queue() -> None:
+    """Monitor Redis queue for reload requests from web.py.
+    
+    Web should push cogs.web reload requests to 'bot:reload_queue' 
+    instead of doing it directly, to avoid reloading while serving requests.
+    """
+    store = get_storage()
+    if not store.redis_available:
+        logger.warning("Redis unavailable — reload queue monitoring disabled")
+        return
+
+    redis = getattr(store, "_redis", None)
+    if redis is None:
+        logger.warning("Redis client unavailable — reload queue monitoring disabled")
+        return
+
+    logger.info("Started reload queue monitoring")
+    while True:
+        try:
+            await asyncio.sleep(2)  # Poll every 2 seconds
+            # Pop one reload request from the queue
+            module = await redis.lpop("bot:reload_queue")
+            if not module:
+                continue
+
+            module = module.decode() if isinstance(module, bytes) else str(module)
+            module = module.strip()
+            if not module:
+                continue
+
+            logger.info("Processing queued reload request: %s", module)
+            try:
+                if module in bot.extensions:
+                    await bot.reload_extension(module)
+                else:
+                    await bot.load_extension(module)
+                logger.info("Successfully reloaded: %s", module)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Reload failed for '%s': %s", module, exc, exc_info=True)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Reload queue monitor error: %s", exc, exc_info=True)
+            await asyncio.sleep(5)  # Back off on error
+
+    logger.info("Reload queue monitoring stopped")
+
+
+# ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
 @bot.event
 async def on_ready() -> None:
+    global _reload_task
+    
     await sync_app_commands_once()
     logger.info("Logged in as %s (id=%d)", bot.user, bot.user.id)
     logger.info("Guilds: %d", len(bot.guilds))
+    
+    # Start reload queue monitor if not already running
+    if _reload_task is None or _reload_task.done():
+        _reload_task = asyncio.create_task(monitor_reload_queue())
 
 
 @bot.event

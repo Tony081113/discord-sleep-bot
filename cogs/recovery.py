@@ -9,6 +9,8 @@
 import asyncio
 import json
 import os
+import pathlib
+import time
 from typing import Any
 
 import aiohttp
@@ -31,7 +33,6 @@ logger = setup_logger(__name__)
 _RECOVERY_LOOKBACK = 300  # seconds (5 minutes)
 _WEBHOOK_NAME = "SleepBot Recovery"
 _MAX_RESTORE_MESSAGES = 100
-_WEBHOOK_SEND_DELAY = 0.6  # seconds between webhook sends (rate-limit safety)
 _FILE_RESTORE_UNSUPPORTED_TEXT = "暫不支持還原"
 
 
@@ -48,22 +49,40 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, value))
 
 
+def _env_float(name: str, default: float, min_value: float, max_value: float) -> float:
+    """Read float from env with clamped safety bounds."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid env %s=%r, fallback=%s", name, raw, default)
+        return default
+    return max(min_value, min(max_value, value))
+
+
+_WEBHOOK_SEND_DELAY = _env_float(
+    "RECOVERY_WEBHOOK_SEND_DELAY", default=0.35, min_value=0.1, max_value=2.0
+)
+
+
 _RECOVERY_DEFENSE_PAUSE_SECONDS = _env_int(
     "RECOVERY_DEFENSE_PAUSE_SECONDS", default=180, min_value=60, max_value=900
 )
 
 
 _ROLE_MEMBER_RESTORE_CONCURRENCY = _env_int(
-    "RECOVERY_ROLE_MEMBER_CONCURRENCY", default=3, min_value=1, max_value=8
+    "RECOVERY_ROLE_MEMBER_CONCURRENCY", default=4, min_value=1, max_value=8
 )
 _MESSAGE_RESTORE_CHANNEL_CONCURRENCY = _env_int(
-    "RECOVERY_MESSAGE_CHANNEL_CONCURRENCY", default=2, min_value=1, max_value=5
+    "RECOVERY_MESSAGE_CHANNEL_CONCURRENCY", default=3, min_value=1, max_value=5
 )
 _CHANNEL_RESTORE_CONCURRENCY = _env_int(
-    "RECOVERY_CHANNEL_RESTORE_CONCURRENCY", default=2, min_value=1, max_value=4
+    "RECOVERY_CHANNEL_RESTORE_CONCURRENCY", default=3, min_value=1, max_value=4
 )
 _ROLE_RESTORE_CONCURRENCY = _env_int(
-    "RECOVERY_ROLE_RESTORE_CONCURRENCY", default=2, min_value=1, max_value=4
+    "RECOVERY_ROLE_RESTORE_CONCURRENCY", default=3, min_value=1, max_value=4
 )
 _CHANNEL_DELETE_CONCURRENCY = _env_int(
     "RECOVERY_CHANNEL_DELETE_CONCURRENCY", default=2, min_value=1, max_value=4
@@ -75,6 +94,13 @@ _ALERT_EDIT_CONCURRENCY = _env_int(
     "RECOVERY_ALERT_EDIT_CONCURRENCY", default=3, min_value=1, max_value=8
 )
 
+_RECOVERY_RESUME_QUEUE_FILE = pathlib.Path(
+    os.getenv(
+        "RECOVERY_RESUME_QUEUE_FILE",
+        str(pathlib.Path(__file__).resolve().parent.parent / "recovery_resume_queue.json"),
+    )
+)
+
 
 class RecoveryCog(commands.Cog, name="Recovery"):
     """負責伺服器結構與訊息的復原。"""
@@ -83,8 +109,12 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         self.bot = bot
         # 每個 guild 只允許單一還原流程同時執行，避免併發造成 429。
         self._guild_recovery_locks: dict[str, asyncio.Lock] = {}
+        # 目前執行中的復原（供關機等待與跨重啟排程）。
+        self._active_recoveries: dict[str, dict[str, Any]] = {}
         # 復原階段建立的舊頻道 -> 新頻道映射，供訊息還原精準定位頻道。
         self._last_channel_restore_map: dict[str, str] = {}
+        # 啟動後僅恢復一次關機排隊的復原任務。
+        self._resume_queue_started = False
 
     async def run_recovery_with_lock(
         self,
@@ -100,7 +130,198 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             self._guild_recovery_locks[guild_id] = lock
 
         async with lock:
-            return await self._execute_recovery(store, guild, request_id)
+            self._active_recoveries[guild_id] = {
+                "request_id": request_id,
+                "started_at": int(time.time()),
+            }
+            try:
+                return await self._execute_recovery(store, guild, request_id)
+            finally:
+                self._active_recoveries.pop(guild_id, None)
+
+    def is_recovery_in_progress(self, guild_id: str | int) -> bool:
+        """回傳指定 guild 是否已有還原流程正在執行。"""
+        key = str(guild_id)
+        lock = self._guild_recovery_locks.get(key)
+        return bool(lock and lock.locked())
+
+    def get_active_recovery_snapshot(self) -> list[dict[str, Any]]:
+        """取得目前復原中的 guild 快照。"""
+        snapshot: list[dict[str, Any]] = []
+        for guild_id, payload in self._active_recoveries.items():
+            snapshot.append(
+                {
+                    "guild_id": guild_id,
+                    "request_id": payload.get("request_id"),
+                    "started_at": payload.get("started_at"),
+                }
+            )
+        return snapshot
+
+    async def wait_for_all_recoveries(self, timeout_seconds: int) -> tuple[bool, list[dict[str, Any]]]:
+        """等待所有進行中復原完成；回傳 (是否全部完成, 剩餘清單)。"""
+        deadline = time.monotonic() + max(0, timeout_seconds)
+        while self._active_recoveries and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+        return (len(self._active_recoveries) == 0, self.get_active_recovery_snapshot())
+
+    def persist_recovery_resume_queue(self, entries: list[dict[str, Any]]) -> int:
+        """把未完成復原寫入本地檔，供下次開機續跑。"""
+        if not entries:
+            return 0
+
+        queue: list[dict[str, Any]] = []
+        if _RECOVERY_RESUME_QUEUE_FILE.exists():
+            try:
+                queue = json.loads(_RECOVERY_RESUME_QUEUE_FILE.read_text(encoding="utf-8"))
+                if not isinstance(queue, list):
+                    queue = []
+            except Exception:
+                queue = []
+
+        queued_at = int(time.time())
+        existing = {(str(i.get("guild_id")), str(i.get("request_id") or "")) for i in queue if isinstance(i, dict)}
+        for item in entries:
+            guild_id = str(item.get("guild_id") or "").strip()
+            if not guild_id:
+                continue
+            request_id = str(item.get("request_id") or "")
+            key = (guild_id, request_id)
+            if key in existing:
+                continue
+            queue.append(
+                {
+                    "guild_id": guild_id,
+                    "request_id": request_id or None,
+                    "queued_at": queued_at,
+                    "source": "shutdown",
+                }
+            )
+            existing.add(key)
+
+        _RECOVERY_RESUME_QUEUE_FILE.write_text(
+            json.dumps(queue, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return len(queue)
+
+    def enqueue_recovery_for_next_startup(
+        self,
+        guild_id: str | int,
+        request_id: str | None = None,
+        *,
+        source: str = "shutdown",
+    ) -> bool:
+        """將單筆復原任務排入下次開機佇列。"""
+        gid = str(guild_id).strip()
+        if not gid:
+            return False
+        before_size = 0
+        if _RECOVERY_RESUME_QUEUE_FILE.exists():
+            try:
+                existing = json.loads(_RECOVERY_RESUME_QUEUE_FILE.read_text(encoding="utf-8"))
+                if isinstance(existing, list):
+                    before_size = len(existing)
+            except Exception:
+                before_size = 0
+        after_size = self.persist_recovery_resume_queue(
+            [
+                {
+                    "guild_id": gid,
+                    "request_id": request_id,
+                    "source": source,
+                }
+            ]
+        )
+        return after_size > before_size
+
+    async def _resume_recoveries_from_queue(self) -> None:
+        """開機後續跑關機前排隊的復原任務。"""
+        if not _RECOVERY_RESUME_QUEUE_FILE.exists():
+            return
+
+        try:
+            raw = _RECOVERY_RESUME_QUEUE_FILE.read_text(encoding="utf-8")
+            queue = json.loads(raw)
+            if not isinstance(queue, list):
+                queue = []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to load recovery resume queue: %s", exc)
+            return
+
+        if not queue:
+            try:
+                _RECOVERY_RESUME_QUEUE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        store = get_storage()
+        remaining: list[dict[str, Any]] = []
+        resumed = 0
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            guild_id = str(item.get("guild_id") or "").strip()
+            request_id = item.get("request_id")
+            if not guild_id:
+                continue
+
+            guild = self.bot.get_guild(int(guild_id))
+            if guild is None:
+                # Bot 目前不在該伺服器，保留到下次開機再試。
+                remaining.append(item)
+                continue
+
+            if self.is_recovery_in_progress(guild_id):
+                remaining.append(item)
+                continue
+
+            try:
+                logger.warning(
+                    "Resuming queued recovery guild=%s request_id=%s",
+                    guild_id,
+                    request_id,
+                )
+                await self.run_recovery_with_lock(store, guild, str(request_id) if request_id else None)
+                resumed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Queued recovery failed guild=%s request_id=%s: %s",
+                    guild_id,
+                    request_id,
+                    exc,
+                    exc_info=True,
+                )
+                remaining.append(item)
+
+        if remaining:
+            try:
+                _RECOVERY_RESUME_QUEUE_FILE.write_text(
+                    json.dumps(remaining, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to persist remaining recovery queue: %s", exc)
+        else:
+            try:
+                _RECOVERY_RESUME_QUEUE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if resumed:
+            logger.warning("Resumed %d queued recovery task(s) after restart", resumed)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Bot ready 後續跑上次關機排隊的復原任務。"""
+        if self._resume_queue_started:
+            return
+        self._resume_queue_started = True
+        asyncio.create_task(
+            self._resume_recoveries_from_queue(),
+            name="recovery_resume_queue",
+        )
 
     async def _gather_bounded(self, coros: list, limit: int) -> list[Any]:
         """執行有界併發：加速還原，同時避免瞬間打滿 API。"""
@@ -179,6 +400,16 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 len(approvers),
             )
             await _send_ephemeral("\u274c 你不是已註冊的核准者。")
+            return
+
+        # 關機流程中：不啟動新復原，改排到下次開機。
+        if bool(getattr(self.bot, "_closing_with_recovery_wait", False)):
+            self.enqueue_recovery_for_next_startup(
+                guild_id,
+                request_id,
+                source="shutdown_interaction",
+            )
+            await _send_ephemeral("⏳ 系統正在關機，這筆復原已排程到下次開機自動執行。")
             return
 
         # 有 request_id 時，先鎖定請求狀態，避免重複執行同一筆復原。
@@ -1270,24 +1501,11 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         try:
             # ── Step 1: 預載快照資料到記憶體 ────────────────────────────────
             anchor_ts = await self._get_recovery_anchor_timestamp(store, guild_id, request_id)
-            guild_snap = await self._get_latest_guild_snapshot(store, guild_id, anchor_ts)
-            channel_snaps = await self._get_pre_attack_snapshots(
-                store,
-                guild_id,
-                "channel",
-                anchor_ts,
-            )
-            role_snaps = await self._get_pre_attack_snapshots(
-                store,
-                guild_id,
-                "role",
-                anchor_ts,
-            )
-            member_snaps = await self._get_pre_attack_snapshots(
-                store,
-                guild_id,
-                "member",
-                anchor_ts,
+            guild_snap, channel_snaps, role_snaps, member_snaps = await asyncio.gather(
+                self._get_latest_guild_snapshot(store, guild_id, anchor_ts),
+                self._get_pre_attack_snapshots(store, guild_id, "channel", anchor_ts),
+                self._get_pre_attack_snapshots(store, guild_id, "role", anchor_ts),
+                self._get_pre_attack_snapshots(store, guild_id, "member", anchor_ts),
             )
 
             def _load_snapshot_rows(rows: list[dict[str, Any]], id_key: str) -> list[dict[str, Any]]:
@@ -1356,18 +1574,21 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 )
 
             # ── Step 2: 刪除快照中不存在的多餘身分組、頻道 ─────────────────
-            await self._delete_extra_roles(guild, snapshot_role_ids)
-            await self._delete_extra_channels(guild, snapshot_channel_ids)
+            await asyncio.gather(
+                self._delete_extra_roles(guild, snapshot_role_ids),
+                self._delete_extra_channels(guild, snapshot_channel_ids),
+            )
 
             # ── Step 3: 依序還原 ─────────────────────────────────────────────
             # 3a. 伺服器名稱 / 橫幅
             await self._restore_guild_profile(guild, guild_snap)
             # 3b. 身分組屬性
             restored_ro, failed_roles = await self._restore_roles(guild, role_data_list)
-            # 3c. 身分組成員
-            await self._restore_role_members(guild, role_data_list)
-            # 3c-2. 成員暱稱（404 找不到使用者時忽略）
-            await self._restore_member_nicks(guild, member_data_list)
+            # 3c. 身分組成員 + 成員暱稱（彼此獨立，可並行縮短流程）
+            await asyncio.gather(
+                self._restore_role_members(guild, role_data_list),
+                self._restore_member_nicks(guild, member_data_list),
+            )
             # 3d. 頻道
             restored_ch = await self._restore_channels(guild, channel_data_list)
             # 3e. 訊息

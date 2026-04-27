@@ -350,6 +350,13 @@ class DataStore:
                 pass
             logger.info("Storage sync task cancelled")
 
+        # Final flush: ensure Redis staged data is persisted to D1 before shutdown.
+        try:
+            await self._sync_redis_to_d1()
+            logger.info("Final Redis → D1 shutdown sync completed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Final Redis → D1 shutdown sync skipped/failed: %s", exc)
+
         # Close Redis
         if self._redis:
             await self._redis.aclose()

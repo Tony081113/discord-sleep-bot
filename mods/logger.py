@@ -12,12 +12,77 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Redis log handler
 # ---------------------------------------------------------------------------
+
+
+class _AsyncRedisWriter:
+    """Background Redis writer to keep logging off the event loop hot path."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue(maxsize=10_000)
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def _ensure_started(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="redis-log-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, redis_client, list_key: str, max_entries: int, payload: str) -> None:
+        self._ensure_started()
+        try:
+            self._queue.put_nowait((redis_client, list_key, max_entries, payload))
+        except queue.Full:
+            # Drop oldest item first so fresh logs can still pass through.
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._queue.put_nowait((redis_client, list_key, max_entries, payload))
+            except queue.Full:
+                return
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                redis_client, list_key, max_entries, payload = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                pipe = redis_client.pipeline()
+                pipe.lpush(list_key, payload)
+                pipe.ltrim(list_key, 0, max_entries - 1)
+                pipe.execute()
+            except Exception:
+                # Swallow worker errors to avoid recursive logging crashes.
+                pass
+
+    def close(self, timeout_seconds: float = 1.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is None:
+            return
+        started = time.monotonic()
+        while thread.is_alive() and (time.monotonic() - started) < timeout_seconds:
+            thread.join(timeout=0.1)
+
+
+_REDIS_WRITER = _AsyncRedisWriter()
 
 class _RedisLogHandler(logging.Handler):
     """Asynchronous-safe handler that pushes log records to a Redis list."""
@@ -51,10 +116,7 @@ class _RedisLogHandler(logging.Handler):
                 entry["exc_info"] = self._exc_formatter.formatException(record.exc_info)
 
             payload = json.dumps(entry, ensure_ascii=False)
-            pipe = self._redis.pipeline()
-            pipe.lpush(self.LIST_KEY, payload)
-            pipe.ltrim(self.LIST_KEY, 0, self.MAX_ENTRIES - 1)
-            pipe.execute()
+            _REDIS_WRITER.submit(self._redis, self.LIST_KEY, self.MAX_ENTRIES, payload)
         except Exception:  # noqa: BLE001
             self.handleError(record)
 
