@@ -30,6 +30,18 @@ const ERRORS = [
   '資料迷路了，可能還在夢遊',
 ];
 
+let _consoleSafetyWarned = false;
+
+function warnConsolePasteScam() {
+  if (_consoleSafetyWarned) return;
+  _consoleSafetyWarned = true;
+
+  const titleStyle = 'font-size:28px;font-weight:800;color:#ef4444;text-shadow:0 1px 0 rgba(0,0,0,.2)';
+  const bodyStyle = 'font-size:14px;line-height:1.6;color:#f8fafc;background:#111827;padding:8px 10px;border-radius:6px';
+  console.log('%c⚠️ 停下來！', titleStyle);
+  console.log('%c如果有人教你把任何東西貼在這裡，你絕對被騙了。\n這通常是盜帳號或竊取權限的社交工程手法。\n不要貼上你看不懂的內容。\n\nIf someone tells you to paste something here, you are being scammed.\nThis is a social engineering trick to steal your account or permissions.\nNever paste code you do not fully understand.', bodyStyle);
+}
+
 // ── Utils ────────────────────────────────────────────────
 function randomError() { return ERRORS[Math.floor(Math.random() * ERRORS.length)]; }
 
@@ -148,13 +160,62 @@ function renderLogin() {
     </div>`;
 }
 
+function getGuildGroups(user) {
+  const groups = user?.guild_groups || {};
+  const mine = Array.isArray(groups.mine) ? groups.mine : (Array.isArray(user?.guilds) ? user.guilds : []);
+  const otherApproved = Array.isArray(groups.other_approved)
+    ? groups.other_approved
+    : (Array.isArray(groups.others) ? groups.others : []);
+  const botOnly = Array.isArray(groups.bot_only) ? groups.bot_only : [];
+  const all = Array.isArray(groups.all) ? groups.all : [...mine, ...otherApproved, ...botOnly];
+  return { mine, otherApproved, botOnly, all };
+}
+
+function getSelectableGuilds(user) {
+  const { mine, all, otherApproved, botOnly } = getGuildGroups(user);
+  if (!user?.is_developer) return mine;
+  if (mine.length || otherApproved.length || botOnly.length) return [...mine, ...otherApproved, ...botOnly];
+  return all;
+}
+
+function buildGuildSelectHTML(user, selectedGuildId) {
+  const { mine, otherApproved, botOnly } = getGuildGroups(user);
+  const baseGuilds = Array.isArray(user?.guilds) ? user.guilds : [];
+
+  if (!user?.is_developer) {
+    return baseGuilds
+      .map(g => `<option value="${esc(g.id)}" ${g.id === selectedGuildId ? 'selected' : ''}>${esc(g.name)}</option>`)
+      .join('');
+  }
+
+  const groupToOptions = (items) => items
+    .map(g => `<option value="${esc(g.id)}" ${g.id === selectedGuildId ? 'selected' : ''}>${esc(g.name)}</option>`)
+    .join('');
+
+  const chunks = [];
+  if (mine.length) {
+    chunks.push(`<optgroup label="我申請到的伺服器">${groupToOptions(mine)}</optgroup>`);
+  }
+  if (otherApproved.length) {
+    chunks.push(`<optgroup label="他人核准的伺服器">${groupToOptions(otherApproved)}</optgroup>`);
+  }
+  if (botOnly.length) {
+    chunks.push(`<optgroup label="僅 bot 在場（尚無核准者）">${groupToOptions(botOnly)}</optgroup>`);
+  }
+
+  if (!chunks.length) {
+    return baseGuilds
+      .map(g => `<option value="${esc(g.id)}" ${g.id === selectedGuildId ? 'selected' : ''}>${esc(g.name)}</option>`)
+      .join('');
+  }
+  return chunks.join('');
+}
+
 // ── Render: app shell ────────────────────────────────────
 function renderApp() {
   const u = S.user;
-  const guilds = u.guilds || [];
-  const guildOpts = guilds.map(g =>
-    `<option value="${esc(g.id)}" ${g.id === S.guild ? 'selected' : ''}>${esc(g.name)}</option>`
-  ).join('');
+  const selectableGuilds = getSelectableGuilds(u);
+  const guildOpts = buildGuildSelectHTML(u, S.guild);
 
   const avatarEl = u.avatar
     ? `<img class="user-avatar" src="${esc(u.avatar)}" alt="">`
@@ -168,7 +229,7 @@ function renderApp() {
           <li class="nav-item active" data-page="overview"><span class="icon">📊</span> 概覽</li>
           <li class="nav-item" data-page="recovery"><span class="icon">🔄</span> 復原管理</li>
           <li class="nav-item" data-page="thresholds"><span class="icon">⚙️</span> 門檻設定</li>
-          <li class="nav-item" data-page="developer" id="devTab" style="display:none"><span class="icon">🔧</span> 開發者</li>
+          <li class="nav-item" data-page="developer" id="devTab" style="display:${u.is_developer ? 'block' : 'none'}"><span class="icon">🔧</span> 開發者</li>
         </ul>
         <div class="sidebar-footer">
           <div class="user-block">${avatarEl}<span class="user-name">${esc(u.username)}</span></div>
@@ -179,9 +240,9 @@ function renderApp() {
         <div class="topbar">
           <button class="mobile-toggle" id="menuToggle">☰</button>
           <div class="greeting">${getGreeting(u.username)}</div>
-          ${guilds.length > 1
+          ${selectableGuilds.length > 1
             ? `<select class="guild-select" id="guildSelect">${guildOpts}</select>`
-            : (guilds.length === 1 ? `<span style="font-size:.85rem;color:var(--text-3)">${esc(guilds[0].name)}</span>` : '')
+            : (selectableGuilds.length === 1 ? `<span style="font-size:.85rem;color:var(--text-3)">${esc(selectableGuilds[0].name)}</span>` : '')
           }
         </div>
         <div class="page-area" id="pageArea">${loadingHTML()}</div>
@@ -259,7 +320,8 @@ function statCard(label, value, color) {
 function renderEventsTable(events) {
   if (!events || !events.length) return emptyHTML('🌙', '過去一片寧靜，什麼事都沒發生');
   const rows = events.slice(0, 15).map(ev => {
-    const info = EVENT_LABELS[ev.event_type] || { icon: '❓', label: ev.event_type, cls: 'update' };
+    const known = EVENT_LABELS[ev.event_type];
+    const info = known || { icon: '❓', label: esc(ev.event_type), cls: 'update' };
     return `<tr>
       <td><span class="badge-event ${info.cls}">${info.icon} ${info.label}</span></td>
       <td class="mono">${esc(ev.target_id)}</td>
@@ -376,7 +438,8 @@ async function pageRecovery(el) {
 }
 
 function renderPendingCard(r) {
-  const info = EVENT_LABELS[r.event_type] || { icon: '❓', label: r.event_type };
+  const known = EVENT_LABELS[r.event_type];
+  const info = known || { icon: '❓', label: esc(r.event_type) };
   const st = STATUS_MAP[r.status] || STATUS_MAP.pending;
   return `
     <div class="request-card">
@@ -392,7 +455,8 @@ function renderPendingCard(r) {
 }
 
 function renderHistoryCard(r) {
-  const info = EVENT_LABELS[r.event_type] || { icon: '❓', label: r.event_type };
+  const known = EVENT_LABELS[r.event_type];
+  const info = known || { icon: '❓', label: esc(r.event_type) };
   const st = STATUS_MAP[r.status] || { label: r.status, cls: 'badge-manual', icon: '•' };
   let result = '';
   if (r.status === 'approved' || r.status === 'completed') {
@@ -430,7 +494,14 @@ async function doManualRecovery(el) {
   if (!await showConfirm('手動復原', '這會將伺服器結構回復至約 5 分鐘前的快照狀態。\n此操作無法撤銷，請確認你真的需要這麼做。')) return;
   try {
     const res = await api(`/api/guilds/${S.guild}/recovery/manual`, { method: 'POST' });
-    toast(`手動復原完成！頻道 ${res.channels} · 身分組 ${res.roles} · 訊息 ${res.messages}`, 'success');
+    if (res?.queued) {
+      toast(res.message || '系統正在關機，這筆手動復原已排程到下次開機執行', 'info');
+    } else {
+      const ch = Number.isFinite(res?.channels) ? res.channels : 0;
+      const ro = Number.isFinite(res?.roles) ? res.roles : 0;
+      const ms = Number.isFinite(res?.messages) ? res.messages : 0;
+      toast(`手動復原完成！頻道 ${ch} · 身分組 ${ro} · 訊息 ${ms}`, 'success');
+    }
     pageRecovery(el);
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -453,11 +524,20 @@ async function pageThresholds(el) {
     const cards = items.map(t => `
       <div class="threshold-card">
         <div class="label">${esc(t.label)}</div>
-        <div class="sublabel">預設值：${t.default} 次 / ${fmtWindow(t.window_seconds)}</div>
+        <div class="sublabel">預設值：${t.default} 次 / ${fmtWindow(t.default_window_seconds || t.window_seconds)}</div>
         <div class="input-row">
           <input type="number" class="form-input input-number"
                  data-event="${esc(t.event_type)}" value="${t.value}" min="1" max="100">
-          <span class="unit">次 / ${fmtWindow(t.window_seconds)}</span>
+          <span class="unit">次</span>
+        </div>
+        <div class="input-row" style="margin-top:.45rem;gap:.5rem;align-items:center;">
+          <input type="number" class="form-input input-number"
+                 data-window-min="${esc(t.event_type)}" value="${Math.floor((t.window_seconds || 0) / 60)}" min="0" max="60">
+          <span class="unit">分</span>
+          <input type="number" class="form-input input-number"
+                 data-window-sec="${esc(t.event_type)}" value="${(t.window_seconds || 0) % 60}" min="0" max="59">
+          <span class="unit">秒</span>
+          <span class="unit" style="margin-left:.25rem;">= ${fmtWindow(t.window_seconds)}</span>
         </div>
       </div>`).join('');
 
@@ -478,7 +558,7 @@ async function pageThresholds(el) {
       </div>
       <p style="color:var(--text-3);font-size:.85rem;margin-bottom:1.3rem;">
         當某類事件在其對應時間窗內超過門檻次數時，系統會觸發異常警報並建立復原請求。<br>
-        數值越低越敏感，越高越寬鬆。調太低可能會誤報，請斟酌設定。
+        現在可同時調整「幾次 / 幾分幾秒」。數值越低越敏感，越高越寬鬆。調太低可能會誤報，請斟酌設定。
       </p>
       <div class="threshold-grid">${cards}</div>
       <button class="btn btn-primary" id="saveThresholds">💾 儲存設定</button>`;
@@ -545,13 +625,31 @@ async function saveThresholds(el) {
   const inputs = el.querySelectorAll('.threshold-card input[data-event]');
   const thresholds = {};
   for (const inp of inputs) {
+    const eventType = inp.dataset.event;
     const v = parseInt(inp.value, 10);
     if (isNaN(v) || v < 1 || v > 100) {
       toast(`「${inp.closest('.threshold-card').querySelector('.label').textContent}」的值必須在 1–100 之間`, 'error');
       inp.focus();
       return;
     }
-    thresholds[inp.dataset.event] = v;
+
+    const minInp = el.querySelector(`input[data-window-min="${CSS.escape(eventType)}"]`);
+    const secInp = el.querySelector(`input[data-window-sec="${CSS.escape(eventType)}"]`);
+    const mins = parseInt(minInp?.value || '0', 10);
+    const secs = parseInt(secInp?.value || '0', 10);
+    if (isNaN(mins) || mins < 0 || mins > 60 || isNaN(secs) || secs < 0 || secs > 59) {
+      toast(`「${inp.closest('.threshold-card').querySelector('.label').textContent}」時間需為 0–60 分、0–59 秒`, 'error');
+      (minInp || secInp || inp).focus();
+      return;
+    }
+    const windowSeconds = (mins * 60) + secs;
+    if (windowSeconds < 1 || windowSeconds > 3600) {
+      toast(`「${inp.closest('.threshold-card').querySelector('.label').textContent}」時間窗需在 1–3600 秒`, 'error');
+      (minInp || secInp || inp).focus();
+      return;
+    }
+
+    thresholds[eventType] = { value: v, window_seconds: windowSeconds };
   }
   const btn = el.querySelector('#saveThresholds');
   btn.disabled = true;
@@ -573,20 +671,64 @@ let _devPoller = null;
 
 // ── Page: developer ──────────────────────────────────────
 async function pageDeveloper(el) {
+  console.log('[pageDeveloper] Start, el:', el);
   if (_devPoller) { clearInterval(_devPoller); _devPoller = null; }
   try {
-    const [devInfo, stats] = await Promise.all([
-      api('/api/dev/info'),
-      api('/api/dev/ratelimit-stats?minutes=5'),
-    ]);
+    console.log('[pageDeveloper] Calling /api/dev/info...');
+    const devInfo = await api('/api/dev/info');
+    console.log('[pageDeveloper] Got devInfo:', devInfo);
 
     if (!devInfo.is_developer) {
       el.innerHTML = emptyHTML('🔒', '你不是開發者');
       return;
     }
+    console.log('[pageDeveloper] is_developer: true');
 
-    const stat = stats.stats || {};
+    let stat = { total_429s: 0, by_scope: {}, by_limit_key: {}, by_bucket: {} };
+    try {
+      console.log('[pageDeveloper] Calling /api/dev/ratelimit-stats...');
+      const statsResp = await api('/api/dev/ratelimit-stats?minutes=5');
+      console.log('[pageDeveloper] Got statsResp:', statsResp);
+      if (statsResp && statsResp.stats && typeof statsResp.stats === 'object') {
+        stat = statsResp.stats;
+        console.log('[pageDeveloper] Assigned stat from API');
+      }
+    } catch (statsErr) {
+      console.debug('dev stats unavailable', statsErr);
+      // stat keeps default empty structure
+    }
+    console.log('[pageDeveloper] stat ready:', stat);
+
     let html = `<div class="page-header"><h2>⚙️ 開發者面板</h2><button class="btn btn-ghost btn-sm" onclick="navigate('developer')">↻ 重新整理</button></div>`;
+
+    // ── Reload 控制 ──────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">♻️ 模組 Reload</div>
+      <p style="margin:.1rem 0 .7rem;color:var(--text-3);font-size:.85rem;line-height:1.6">
+        可輸入指定模組（如 cogs.monitoring）或直接 reload 全部。<br>
+        為避免中斷目前面板連線，Web 端 reload 全部時會略過 cogs.web。
+      </p>
+      <div style="display:flex;gap:.55rem;flex-wrap:wrap">
+        <input id="devReloadCog" class="form-input" style="max-width:320px" placeholder="輸入模組（例如 cogs.monitoring）">
+        <button class="btn btn-primary btn-sm" id="devReloadOne">Reload 指定</button>
+        <button class="btn btn-ghost btn-sm" id="devReloadAll">Reload 全部</button>
+      </div>
+      <div id="devReloadResult" style="margin-top:.65rem;font-size:.82rem;color:var(--text-3)">尚未執行</div>
+    </div>`;
+
+    // ── Commit 控制 ──────────────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">📌 快照 Commit</div>
+      <p style="margin:.1rem 0 .7rem;color:var(--text-3);font-size:.85rem;line-height:1.6">
+        對「目前上方選到的伺服器」執行一次 \`>>commit\` 等效流程（寫入 Redis 快照）。
+      </p>
+      <div style="display:flex;gap:.55rem;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-primary btn-sm" id="devCommitCurrent">對目前伺服器執行 Commit</button>
+      </div>
+      <div id="devCommitResult" style="margin-top:.65rem;font-size:.82rem;color:var(--text-3)">尚未執行</div>
+    </div>`;
 
     // ── 系統資源表 ────────────────────────────────────────
     html += `
@@ -643,10 +785,48 @@ async function pageDeveloper(el) {
     </div>`;
 
     el.innerHTML = html;
-    _devRenderRl(stat);
-    _devStartPoller(el);
+    console.log('[pageDeveloper] Set innerHTML, stat:', stat);
+    
+    try {
+      console.log('[pageDeveloper] Calling _devRenderRl...');
+      _devRenderRl(stat);
+      console.log('[pageDeveloper] _devRenderRl done');
+    } catch (e) {
+      console.error('Failed to render rate-limit stats:', e);
+      const body = document.getElementById('devRlBody');
+      if (body) body.innerHTML = '<span style="color:var(--text-3)">統計暫時無法顯示</span>';
+    }
+    
+    try {
+      console.log('[pageDeveloper] Calling _devStartPoller...');
+      _devStartPoller(el);
+      console.log('[pageDeveloper] _devStartPoller done');
+    } catch (e) {
+      console.error('Failed to start dev poller:', e);
+      // Still allow page to render even if poller fails
+    }
+
+    console.log('[pageDeveloper] Adding event listeners...');
+    el.querySelector('#devReloadOne')?.addEventListener('click', async () => {
+      const input = el.querySelector('#devReloadCog');
+      const cog = (input?.value || '').trim();
+      if (!cog) {
+        toast('請先輸入模組名稱', 'info');
+        input?.focus();
+        return;
+      }
+      await _devReload(el, cog);
+    });
+    el.querySelector('#devReloadAll')?.addEventListener('click', async () => {
+      await _devReload(el, '');
+    });
+    el.querySelector('#devCommitCurrent')?.addEventListener('click', async () => {
+      await _devCommitCurrent(el);
+    });
+    console.log('[pageDeveloper] Done!');
 
   } catch (e) {
+    console.error('[pageDeveloper] Caught error:', e);
     if (_devPoller) { clearInterval(_devPoller); _devPoller = null; }
     if (e.message === 'unauthorized') return;
     el.innerHTML = emptyHTML('😴', randomError());
@@ -812,6 +992,74 @@ function _devRenderRl(stat) {
   if (ts) ts.textContent = '更新於 ' + new Date().toLocaleTimeString();
 }
 
+async function _devReload(el, cog) {
+  const resultEl = el.querySelector('#devReloadResult');
+  const oneBtn = el.querySelector('#devReloadOne');
+  const allBtn = el.querySelector('#devReloadAll');
+  if (oneBtn) oneBtn.disabled = true;
+  if (allBtn) allBtn.disabled = true;
+  if (resultEl) resultEl.textContent = '執行中...';
+
+  try {
+    const payload = cog ? { cog } : {};
+    const res = await api('/api/dev/reload', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    const ok = Array.isArray(res.ok) ? res.ok : [];
+    const failed = Array.isArray(res.failed) ? res.failed : [];
+    const skipped = Array.isArray(res.skipped) ? res.skipped : [];
+
+    const lines = [];
+    if (ok.length) lines.push(`✅ 成功：${ok.join(', ')}`);
+    if (failed.length) lines.push(`❌ 失敗：${failed.join(' | ')}`);
+    if (skipped.length) lines.push(`⏭️ 略過：${skipped.join(', ')}`);
+    if (resultEl) resultEl.textContent = lines.join(' / ') || '無可 reload 模組';
+
+    if (failed.length) {
+      toast(`Reload 完成，但有 ${failed.length} 個失敗`, 'error');
+    } else {
+      toast('Reload 完成', 'success');
+    }
+  } catch (e) {
+    if (resultEl) resultEl.textContent = `❌ 執行失敗：${e.message}`;
+    toast(e.message, 'error');
+  }
+
+  if (oneBtn) oneBtn.disabled = false;
+  if (allBtn) allBtn.disabled = false;
+}
+
+async function _devCommitCurrent(el) {
+  const resultEl = el.querySelector('#devCommitResult');
+  const btn = el.querySelector('#devCommitCurrent');
+  if (!S.guild) {
+    toast('目前沒有可操作的伺服器', 'error');
+    return;
+  }
+
+  const ok = await showConfirm('執行 Commit', '確定要對目前選取的伺服器執行快照 Commit 嗎？');
+  if (!ok) return;
+
+  if (btn) btn.disabled = true;
+  if (resultEl) resultEl.textContent = '執行中...';
+
+  try {
+    const res = await api(`/api/dev/guilds/${encodeURIComponent(S.guild)}/commit`, {
+      method: 'POST',
+    });
+    const line = `✅ ${res.message}（頻道 ${res.channels}、身分組 ${res.roles}、成員 ${res.members}、總快照 ${res.snapshots_total}）`;
+    if (resultEl) resultEl.textContent = line;
+    toast('Commit 完成', 'success');
+  } catch (e) {
+    if (resultEl) resultEl.textContent = `❌ 執行失敗：${e.message}`;
+    toast(e.message, 'error');
+  }
+
+  if (btn) btn.disabled = false;
+}
+
 let _devRlTick = 0;
 function _devStartPoller(el) {
   const tick = async () => {
@@ -840,8 +1088,9 @@ async function init() {
   try {
     const data = await api('/api/me');
     S.user = data;
-    if (data.guilds && data.guilds.length > 0) {
-      S.guild = data.guilds[0].id;
+    const selectableGuilds = getSelectableGuilds(data);
+    if (selectableGuilds.length > 0) {
+      S.guild = selectableGuilds[0].id;
     }
     if (!S.guild) {
       document.getElementById('app').innerHTML = `
@@ -849,29 +1098,13 @@ async function init() {
           <div class="login-card">
             <div class="moon">🌙</div>
             <h1>SleepBot</h1>
-            <p class="tagline">你目前不是任何伺服器的核准者。<br>請先在 Discord 上接受核准者邀請。</p>
+            <p class="tagline">目前找不到你可管理的伺服器。<br>請先在 Discord 上完成核准流程。</p>
             <a href="/auth/logout" class="btn-ghost" style="display:inline-block;padding:.6rem 1.4rem;">登出</a>
           </div>
         </div>`;
       return;
     }
     renderApp();
-    
-    // Check if user is developer
-    try {
-      const devInfo = await api('/api/dev/info');
-      console.log('[DEBUG] devInfo:', devInfo);
-      if (devInfo.is_developer) {
-        const tab = document.getElementById('devTab');
-        if (tab) {
-          tab.style.display = 'block';
-          console.log('[DEBUG] Developer tab shown');
-        }
-      }
-    } catch (e) {
-      // Not a developer or endpoint not available, silently ignore
-      console.log('[DEBUG] Dev check failed:', e.message);
-    }
   } catch (e) {
     if (e.message === 'unauthorized') { renderLogin(); return; }
     document.getElementById('app').innerHTML = `
@@ -887,3 +1120,4 @@ async function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', warnConsolePasteScam);

@@ -124,6 +124,7 @@ _TABLES_DDL: list[str] = [
         guild_id        TEXT NOT NULL,
         event_type      TEXT NOT NULL,
         threshold_value INTEGER NOT NULL,
+        window_seconds  INTEGER NOT NULL DEFAULT 300,
         updated_by      TEXT,
         updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
         FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE,
