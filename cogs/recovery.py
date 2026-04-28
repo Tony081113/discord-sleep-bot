@@ -75,6 +75,9 @@ _RECOVERY_DEFENSE_PAUSE_SECONDS = _env_int(
 _ROLE_MEMBER_RESTORE_CONCURRENCY = _env_int(
     "RECOVERY_ROLE_MEMBER_CONCURRENCY", default=4, min_value=1, max_value=8
 )
+_ROLE_MEMBER_RESTORE_BATCH_SIZE = _env_int(
+    "RECOVERY_ROLE_MEMBER_BATCH_SIZE", default=128, min_value=16, max_value=512
+)
 _MESSAGE_RESTORE_CHANNEL_CONCURRENCY = _env_int(
     "RECOVERY_MESSAGE_CHANNEL_CONCURRENCY", default=3, min_value=1, max_value=5
 )
@@ -165,7 +168,12 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             await asyncio.sleep(0.5)
         return (len(self._active_recoveries) == 0, self.get_active_recovery_snapshot())
 
-    def persist_recovery_resume_queue(self, entries: list[dict[str, Any]]) -> int:
+    def persist_recovery_resume_queue(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        return_added: bool = False,
+    ) -> int:
         """把未完成復原寫入本地檔，供下次開機續跑。"""
         if not entries:
             return 0
@@ -180,6 +188,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 queue = []
 
         queued_at = int(time.time())
+        added = 0
         existing = {(str(i.get("guild_id")), str(i.get("request_id") or "")) for i in queue if isinstance(i, dict)}
         for item in entries:
             guild_id = str(item.get("guild_id") or "").strip()
@@ -198,12 +207,14 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 }
             )
             existing.add(key)
+            added += 1
 
-        _RECOVERY_RESUME_QUEUE_FILE.write_text(
-            json.dumps(queue, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return len(queue)
+        if added:
+            _RECOVERY_RESUME_QUEUE_FILE.write_text(
+                json.dumps(queue, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return added if return_added else len(queue)
 
     def enqueue_recovery_for_next_startup(
         self,
@@ -216,24 +227,17 @@ class RecoveryCog(commands.Cog, name="Recovery"):
         gid = str(guild_id).strip()
         if not gid:
             return False
-        before_size = 0
-        if _RECOVERY_RESUME_QUEUE_FILE.exists():
-            try:
-                existing = json.loads(_RECOVERY_RESUME_QUEUE_FILE.read_text(encoding="utf-8"))
-                if isinstance(existing, list):
-                    before_size = len(existing)
-            except Exception:
-                before_size = 0
-        after_size = self.persist_recovery_resume_queue(
+        added = self.persist_recovery_resume_queue(
             [
                 {
                     "guild_id": gid,
                     "request_id": request_id,
                     "source": source,
                 }
-            ]
+            ],
+            return_added=True,
         )
-        return after_size > before_size
+        return added > 0
 
     async def _resume_recoveries_from_queue(self) -> None:
         """開機後續跑關機前排隊的復原任務。"""
@@ -1880,6 +1884,15 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 )
 
         jobs = []
+        member_role_ids_cache: dict[int, set[int]] = {}
+
+        async def _flush_jobs() -> None:
+            if not jobs:
+                return
+            pending = list(jobs)
+            jobs.clear()
+            await self._gather_bounded(pending, _ROLE_MEMBER_RESTORE_CONCURRENCY)
+
         for data in role_data_list:
             role_id = data["role_id"]
             member_ids: list[str] = data.get("members", [])
@@ -1892,11 +1905,18 @@ class RecoveryCog(commands.Cog, name="Recovery"):
                 member = guild.get_member(int(uid_str))
                 if not member:
                     continue
-                if role in member.roles:
+                role_ids = member_role_ids_cache.get(member.id)
+                if role_ids is None:
+                    role_ids = {r.id for r in member.roles}
+                    member_role_ids_cache[member.id] = role_ids
+                if role.id in role_ids:
                     continue
                 jobs.append(_restore_one(member, role, uid_str))
+                role_ids.add(role.id)
+                if len(jobs) >= _ROLE_MEMBER_RESTORE_BATCH_SIZE:
+                    await _flush_jobs()
 
-        await self._gather_bounded(jobs, _ROLE_MEMBER_RESTORE_CONCURRENCY)
+        await _flush_jobs()
 
     async def _unpin_snapshots(self, store, guild_id: str) -> None:
         """解除此 guild 所有 pinned 快照的保留標記。"""

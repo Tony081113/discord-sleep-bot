@@ -174,14 +174,27 @@ async def cmd_commit(ctx: commands.Context) -> None:
             await ctx.send("⚠️ commit skipped: Redis client unavailable")
             return
 
-        redis_batch: list[str] = []
-        redis_prefix = f"sync:recovery:commit:{guild_id}"
-        redis_batch.append(f"{redis_prefix}:guild:{guild_id}")
-        redis_batch.append(json.dumps(guild_data, ensure_ascii=False))
+        pending_pairs: list[tuple[str, str]] = []
+        pending_chunk_pairs = 50
+        total_snapshots = 0
 
-        channel_payloads: list[tuple[str, str]] = []
-        role_payloads: list[tuple[str, str]] = []
-        member_payloads: list[tuple[str, str]] = []
+        async def _flush_pending() -> None:
+            nonlocal total_snapshots
+            if not pending_pairs:
+                return
+            await redis.mset(dict(pending_pairs))
+            pipe = redis.pipeline(transaction=False)
+            for key, _ in pending_pairs:
+                pipe.expire(key, 3600)
+            await pipe.execute()
+            total_snapshots += len(pending_pairs)
+            pending_pairs.clear()
+
+        def _queue_snapshot(key: str, payload: dict[str, object]) -> None:
+            pending_pairs.append((key, json.dumps(payload, ensure_ascii=False)))
+
+        redis_prefix = f"sync:recovery:commit:{guild_id}"
+        _queue_snapshot(f"{redis_prefix}:guild:{guild_id}", guild_data)
 
         for channel in guild.channels:
             ch_data = {
@@ -206,12 +219,9 @@ async def cmd_commit(ctx: commands.Context) -> None:
                 ch_data["nsfw"] = channel.nsfw
                 ch_data["slowmode_delay"] = channel.slowmode_delay
 
-            channel_payloads.append((
-                str(channel.id),
-                json.dumps(ch_data, ensure_ascii=False),
-            ))
-            redis_batch.append(f"{redis_prefix}:channel:{channel.id}")
-            redis_batch.append(channel_payloads[-1][1])
+            _queue_snapshot(f"{redis_prefix}:channel:{channel.id}", ch_data)
+            if len(pending_pairs) >= pending_chunk_pairs:
+                await _flush_pending()
             ch_count += 1
 
         for role in guild.roles:
@@ -225,12 +235,9 @@ async def cmd_commit(ctx: commands.Context) -> None:
                 "mentionable": role.mentionable,
                 "members": [str(member.id) for member in role.members],
             }
-            role_payloads.append((
-                str(role.id),
-                json.dumps(role_data, ensure_ascii=False),
-            ))
-            redis_batch.append(f"{redis_prefix}:role:{role.id}")
-            redis_batch.append(role_payloads[-1][1])
+            _queue_snapshot(f"{redis_prefix}:role:{role.id}", role_data)
+            if len(pending_pairs) >= pending_chunk_pairs:
+                await _flush_pending()
             ro_count += 1
 
         for member in guild.members:
@@ -238,23 +245,12 @@ async def cmd_commit(ctx: commands.Context) -> None:
                 "user_id": str(member.id),
                 "nick": member.nick,
             }
-            member_payloads.append((
-                str(member.id),
-                json.dumps(member_data, ensure_ascii=False),
-            ))
-            redis_batch.append(f"{redis_prefix}:member:{member.id}")
-            redis_batch.append(member_payloads[-1][1])
+            _queue_snapshot(f"{redis_prefix}:member:{member.id}", member_data)
+            if len(pending_pairs) >= pending_chunk_pairs:
+                await _flush_pending()
             mb_count += 1
 
-        chunk_size = 100
-        for i in range(0, len(redis_batch), chunk_size):
-            chunk = redis_batch[i : i + chunk_size]
-            pairs = {chunk[j]: chunk[j + 1] for j in range(0, len(chunk), 2)}
-            await redis.mset(pairs)
-        for i in range(0, len(redis_batch), 2):
-            await redis.expire(redis_batch[i], 3600)
-
-        total_snapshots = len(redis_batch) // 2
+        await _flush_pending()
 
         logger.info(
             "Manual commit snapshot staged to Redis guild=%s channels=%d roles=%d members=%d user=%s",

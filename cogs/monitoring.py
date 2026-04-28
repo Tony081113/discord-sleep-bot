@@ -255,6 +255,8 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self._last_alert_at: dict[str, float] = {}
         # 已發送的告警訊息 ID：(guild_id, user_id) -> message_id，用於編輯而非重發。
         self._last_alert_msg_ids: dict[tuple[str, str], int] = {}
+        # 已在本次 session 發送過告警的 guild，加速 pending-alert 判斷。
+        self._guilds_with_alert_msgs: set[str] = set()
         # 近期已處置的攻擊者，避免短時間重複執行相同封鎖流程。
         self._neutralized_attackers_at: dict[tuple[str, int], float] = {}
         # 近期已記錄的 webhook 建立事件，避免 on_webhooks_update 重複寫入。
@@ -1654,6 +1656,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         scanned_entries_by_action: dict[str, int] = {}
         scanned_users_by_action: dict[str, list[int]] = {}
         cutoff = time.time() - _ANOMALY_WINDOW
+        bot_user_id = self.bot.user.id if self.bot.user else None
 
         for action in actions:
             scanned_users: set[int] = set()
@@ -1665,7 +1668,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         break
                     if entry.user:
                         scanned_users.add(entry.user.id)
-                        if entry.user.id != (self.bot.user.id if self.bot.user else None):
+                        if entry.user.id != bot_user_id:
                             attacker_ids.add(entry.user.id)
             except discord.Forbidden:
                 logger.warning(
@@ -1695,7 +1698,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         break
                     if not entry.user:
                         continue
-                    if entry.user.id == (self.bot.user.id if self.bot.user else None):
+                    if entry.user.id == bot_user_id:
                         continue
                     if self._is_suspicious_audit_action(entry.action):
                         fallback_users.add(entry.user.id)
@@ -2184,6 +2187,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                                 "Failed to save attacker_ids request_id=%s: %s", request_id, exc
                             )
                     ban_now = time.time()
+                    ids_to_ban: set[int] = set()
                     for uid in attacker_ids:
                         member = guild.get_member(uid)
                         # 對仍在場的機器人攻擊者不使用冷卻，避免快速重加造成防禦空窗。
@@ -2195,9 +2199,12 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                                 uid,
                             )
                             continue
+                        ids_to_ban.add(uid)
+
+                    if ids_to_ban:
                         await self._ban_user_ids(
                             guild=guild,
-                            user_ids={uid},
+                            user_ids=ids_to_ban,
                             source_message_id=str(request_id or ""),
                             source_kind=f"anomaly:{event_type}",
                         )
@@ -2205,8 +2212,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             # 有 pending 請求時，若本次 session 已有傳送過告警訊息的紀錄，則跳過；
             # 否則（例如機器人重啟後遺失 in-memory 紀錄）仍需補發告警。
             if existing_pending_request:
-                has_in_session_alert = any(k[0] == guild_id for k in self._last_alert_msg_ids)
-                if has_in_session_alert:
+                if guild_id in self._guilds_with_alert_msgs:
                     return
 
             now = time.time()
@@ -2368,6 +2374,7 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                         limit_key="dm_send",
                     )
                     self._last_alert_msg_ids[msg_key] = msg.id
+                    self._guilds_with_alert_msgs.add(guild_id)
                     logger.info(
                         "Sent anomaly alert guild=%s approver=%s event=%s request_id=%s",
                         guild_id,

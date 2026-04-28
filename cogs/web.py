@@ -794,10 +794,28 @@ async def _commit_snapshot_to_redis(guild: discord.Guild, actor_id: str) -> dict
         "banner_url": str(guild.banner.url) if guild.banner else None,
     }
 
-    redis_batch: list[str] = []
+    # 分塊即時寫入，避免大型 guild 一次累積所有快照佔用過多記憶體。
+    pending_pairs: list[tuple[str, str]] = []
+    pending_chunk_pairs = 50
+    total_snapshots = 0
+
+    async def _flush_pending() -> None:
+        nonlocal total_snapshots
+        if not pending_pairs:
+            return
+        await redis.mset(dict(pending_pairs))
+        pipe = redis.pipeline(transaction=False)
+        for key, _ in pending_pairs:
+            pipe.expire(key, 3600)
+        await pipe.execute()
+        total_snapshots += len(pending_pairs)
+        pending_pairs.clear()
+
+    def _queue_snapshot(key: str, payload: dict[str, Any]) -> None:
+        pending_pairs.append((key, json.dumps(payload, ensure_ascii=False)))
+
     redis_prefix = f"sync:recovery:commit:{guild_id}"
-    redis_batch.append(f"{redis_prefix}:guild:{guild_id}")
-    redis_batch.append(json.dumps(guild_data, ensure_ascii=False))
+    _queue_snapshot(f"{redis_prefix}:guild:{guild_id}", guild_data)
 
     for channel in guild.channels:
         ch_data = {
@@ -824,8 +842,9 @@ async def _commit_snapshot_to_redis(guild: discord.Guild, actor_id: str) -> dict
             ch_data["nsfw"] = channel.nsfw
             ch_data["slowmode_delay"] = channel.slowmode_delay
 
-        redis_batch.append(f"{redis_prefix}:channel:{channel.id}")
-        redis_batch.append(json.dumps(ch_data, ensure_ascii=False))
+        _queue_snapshot(f"{redis_prefix}:channel:{channel.id}", ch_data)
+        if len(pending_pairs) >= pending_chunk_pairs:
+            await _flush_pending()
         ch_count += 1
 
     for role in guild.roles:
@@ -839,8 +858,9 @@ async def _commit_snapshot_to_redis(guild: discord.Guild, actor_id: str) -> dict
             "mentionable": role.mentionable,
             "members": [str(member.id) for member in role.members],
         }
-        redis_batch.append(f"{redis_prefix}:role:{role.id}")
-        redis_batch.append(json.dumps(role_data, ensure_ascii=False))
+        _queue_snapshot(f"{redis_prefix}:role:{role.id}", role_data)
+        if len(pending_pairs) >= pending_chunk_pairs:
+            await _flush_pending()
         ro_count += 1
 
     for member in guild.members:
@@ -848,20 +868,13 @@ async def _commit_snapshot_to_redis(guild: discord.Guild, actor_id: str) -> dict
             "user_id": str(member.id),
             "nick": member.nick,
         }
-        redis_batch.append(f"{redis_prefix}:member:{member.id}")
-        redis_batch.append(json.dumps(member_data, ensure_ascii=False))
+        _queue_snapshot(f"{redis_prefix}:member:{member.id}", member_data)
+        if len(pending_pairs) >= pending_chunk_pairs:
+            await _flush_pending()
         mb_count += 1
 
-    chunk_size = 100
-    for i in range(0, len(redis_batch), chunk_size):
-        chunk = redis_batch[i : i + chunk_size]
-        pairs = {chunk[j]: chunk[j + 1] for j in range(0, len(chunk), 2)}
-        await redis.mset(pairs)
+    await _flush_pending()
 
-    for i in range(0, len(redis_batch), 2):
-        await redis.expire(redis_batch[i], 3600)
-
-    total_snapshots = len(redis_batch) // 2
     logger.info(
         "Web commit snapshot staged guild=%s channels=%d roles=%d members=%d user=%s",
         guild_id,
