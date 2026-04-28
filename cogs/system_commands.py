@@ -372,6 +372,106 @@ class SystemCommandsCog(commands.Cog, name="SystemCommands"):
             await interaction.followup.send(f"❌ 快照失敗：{exc}", ephemeral=True)
 
 
+_DEV_IDS = set(
+    str(uid.strip())
+    for uid in os.getenv("BOT_ADMIN_ID", "").split(",")
+    if uid.strip()
+)
+
+
+class DevCommandsCog(commands.Cog, name="DevCommands"):
+    """開發者限定前綴指令。"""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    def _is_developer(self, user_id: int) -> bool:
+        return str(user_id) in _DEV_IDS
+
+    @commands.command(name="unban", hidden=True)
+    async def dev_unban(self, ctx: commands.Context, user_id: int, guild_id: int | None = None) -> None:
+        """>>unban <user_id> [guild_id]
+        解除封鎖，並從所有 pending recovery_requests.attacker_ids 移除該 ID，避免重新加入時被自動再 ban。
+        只有 BOT_ADMIN_ID 中的開發者可使用。
+        """
+        if not self._is_developer(ctx.author.id):
+            await ctx.message.add_reaction("🚫")
+            return
+
+        target_guild = (
+            self.bot.get_guild(guild_id) if guild_id else ctx.guild
+        )
+        if target_guild is None:
+            await ctx.reply(f"❌ 找不到伺服器 `{guild_id}`。")
+            return
+
+        # 1. Discord unban
+        unban_ok = False
+        try:
+            await target_guild.unban(
+                discord.Object(id=user_id),
+                reason=f"Developer unban by {ctx.author} ({ctx.author.id})",
+            )
+            unban_ok = True
+        except discord.NotFound:
+            unban_ok = True  # 本來就沒被 ban，當作成功
+        except discord.Forbidden:
+            await ctx.reply(f"❌ 無法解除封鎖 `{user_id}`：Bot 權限不足。")
+            return
+        except discord.HTTPException as exc:
+            await ctx.reply(f"❌ Discord API 錯誤：{exc}")
+            return
+
+        # 2. 從 DB 所有 pending recovery_requests 的 attacker_ids 移除
+        store = get_storage()
+        guild_id_str = str(target_guild.id)
+        uid_str = str(user_id)
+        cleaned = 0
+        try:
+            rows = await store.fetchall(
+                "SELECT id, attacker_ids FROM recovery_requests "
+                "WHERE guild_id = ? AND attacker_ids IS NOT NULL AND attacker_ids != ''",
+                [guild_id_str],
+            )
+            for row in rows:
+                raw = row.get("attacker_ids")
+                if not raw:
+                    continue
+                try:
+                    ids: list = json.loads(raw)
+                except Exception:
+                    continue
+                if uid_str not in [str(i) for i in ids]:
+                    continue
+                new_ids = [i for i in ids if str(i) != uid_str]
+                await store.execute(
+                    "UPDATE recovery_requests SET attacker_ids = ? WHERE id = ?",
+                    [json.dumps(new_ids), row["id"]],
+                )
+                cleaned += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dev_unban: failed to clean attacker_ids guild=%s user=%s: %s",
+                guild_id_str, user_id, exc,
+            )
+
+        # 3. 清除 monitoring cog 的 in-memory 冷卻記錄
+        monitoring_cog = self.bot.get_cog("Monitoring")
+        if monitoring_cog:
+            key = (guild_id_str, user_id)
+            monitoring_cog._neutralized_attackers_at.pop(key, None)
+
+        logger.info(
+            "dev_unban: user=%s guild=%s cleaned_requests=%d by=%s",
+            user_id, target_guild.id, cleaned, ctx.author.id,
+        )
+        await ctx.reply(
+            f"✅ 已解除封鎖 `{user_id}` 於 **{target_guild.name}**。\n"
+            f"已從 {cleaned} 筆 recovery_request 移除攻擊者記錄。"
+        )
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(SystemCommandsCog(bot))
+    await bot.add_cog(DevCommandsCog(bot))
     logger.info("SystemCommands cog loaded")

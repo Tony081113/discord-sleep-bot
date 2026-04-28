@@ -261,6 +261,8 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
         self._recent_webhook_create_seen_at: dict[tuple[str, str], float] = {}
         # 訊息清理節流，避免每則訊息都執行重型清理 SQL。
         self._last_message_cleanup_at: dict[str, float] = {}
+        # 攻擊者掃描節流：避免同一伺服器在短時間內重複呼叫稽核 API。
+        self._attacker_scan_at: dict[str, float] = {}
 
     def _log_deferred(self, level: int, message: str, *args: Any) -> None:
         """將高頻 log 延後到下一個 event-loop tick，避免塞住當前 async 熱路徑。"""
@@ -1532,6 +1534,10 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                     user_id,
                     source_message_id,
                 )
+                asyncio.create_task(
+                    self._request_manual_ban(guild, user_id, source_kind),
+                    name=f"manual_ban_req_{guild.id}_{user_id}",
+                )
             except discord.HTTPException as exc:
                 logger.error(
                     "Ban failed guild=%s user=%s source_message=%s: %s",
@@ -1546,6 +1552,92 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             [_neutralize_one(user_id) for user_id in sorted(user_ids)],
             _ATTACKER_BAN_CONCURRENCY,
         )
+
+    async def _request_manual_ban(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        source_kind: str,
+    ) -> None:
+        """Bot 無法直接封鎖時，委派給位階足夠的審核者或擁有者手動封鎖。"""
+        # 擁有者已在 _neutralize_one 開頭跳過，不會到這裡
+        if user_id == guild.owner_id:
+            return
+
+        member = guild.get_member(user_id)
+        target_top_pos = member.top_role.position if member else 0
+        target_display = member.display_name if member else str(user_id)
+
+        store = get_storage()
+        try:
+            rows = await store.fetchall(
+                "SELECT user_id FROM recovery_approvers WHERE guild_id = ?",
+                [str(guild.id)],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to fetch approvers for manual ban guild=%s target=%s: %s",
+                guild.id, user_id, exc,
+            )
+            rows = []
+
+        # 找出位階比目標高的審核者
+        qualified: list[discord.Member] = [
+            m
+            for row in rows
+            if (m := guild.get_member(int(row["user_id"])))
+            and m.top_role.position > target_top_pos
+        ]
+
+        embed = discord.Embed(
+            title="⚠️ 需要手動封鎖攻擊者",
+            description=(
+                f"Bot 無法封鎖 **{target_display}** (`{user_id}`)，因為對方位階高於 Bot。\n\n"
+                f"偵測來源：`{source_kind}`\n\n"
+                f"請手動封鎖此使用者：<@{user_id}>"
+            ),
+            color=discord.Color.orange(),
+        )
+
+        recipients: list[Any] = []
+        if qualified:
+            recipients = qualified
+            logger.warning(
+                "Requesting manual ban from %d approver(s) guild=%s target=%s",
+                len(qualified), guild.id, user_id,
+            )
+        else:
+            # 無審核者位階足夠：改通知擁有者
+            owner: Any = guild.owner
+            if owner is None and guild.owner_id:
+                try:
+                    owner = await rate_limited_call(
+                        self.bot.fetch_user,
+                        guild.owner_id,
+                        limit_key="user_fetch",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            if owner:
+                embed.description += "\n\n\uff08無審核者位階足夠，已通知伺服器擁有者）"
+                recipients = [owner]
+                logger.warning(
+                    "No qualified approver for manual ban, notifying owner guild=%s target=%s",
+                    guild.id, user_id,
+                )
+
+        for recipient in recipients:
+            try:
+                await rate_limited_call(
+                    recipient.send,
+                    embed=embed,
+                    limit_key="dm_send",
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "Cannot DM manual ban request guild=%s recipient=%s target=%s: %s",
+                    guild.id, recipient.id, user_id, exc,
+                )
 
     async def _find_attackers_from_audit(
         self, guild: discord.Guild, event_type: str
@@ -2059,7 +2151,22 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             # 非 message_spam 事件透過稽核紀錄找出攻擊者並立即處置。
             # message_spam 攻擊者已在 _handle_message_spam_detected 中處理。
             if event_type != "message_spam":
-                attacker_ids = await self._find_attackers_from_audit(guild, event_type)
+                scan_key = f"{guild_id}:{event_type}"
+                scan_now = time.time()
+                last_scan = self._attacker_scan_at.get(scan_key, 0.0)
+                _ATTACKER_SCAN_COOLDOWN = 30  # 30 秒內不重複掃描稽核紀錄
+                if (scan_now - last_scan) < _ATTACKER_SCAN_COOLDOWN:
+                    logger.debug(
+                        "Skip attacker scan (cooldown) guild=%s event=%s since_last=%.1fs",
+                        guild_id, event_type, scan_now - last_scan,
+                    )
+                    if existing_pending_request:
+                        return
+                    # 非 pending 情況下跳過掃描，直接進入 alert 流程
+                    attacker_ids = set()
+                else:
+                    self._attacker_scan_at[scan_key] = scan_now
+                    attacker_ids = await self._find_attackers_from_audit(guild, event_type)
                 if attacker_ids:
                     logger.warning(
                         "Found %d attacker(s) guild=%s event=%s ids=%s",
@@ -2095,10 +2202,12 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
                             source_kind=f"anomaly:{event_type}",
                         )
 
-            # 有 pending 請求時，避免重複建立請求與重複告警；
-            # 但上面的攻擊者辨識與封鎖仍會執行。
+            # 有 pending 請求時，若本次 session 已有傳送過告警訊息的紀錄，則跳過；
+            # 否則（例如機器人重啟後遺失 in-memory 紀錄）仍需補發告警。
             if existing_pending_request:
-                return
+                has_in_session_alert = any(k[0] == guild_id for k in self._last_alert_msg_ids)
+                if has_in_session_alert:
+                    return
 
             now = time.time()
             last_alert = self._last_alert_at.get(lock_key, 0.0)
