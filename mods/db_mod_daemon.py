@@ -70,6 +70,18 @@ class DaemonBridge:
                     raise RuntimeError(f"daemon error {resp.status}: {body}")
                 return body
 
+    async def _get_json(self, path: str) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        url = f"{self.base_url}{path}"
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=self._headers()) as resp:
+                self._verify_daemon_token(resp)
+                body = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"daemon error {resp.status}: {body}")
+                return body
+
     async def handshake(self) -> dict[str, Any]:
         return await self._post_json("/v1/handshake", {})
 
@@ -107,6 +119,62 @@ class DaemonBridge:
         if bucket:
             request_payload["bucket"] = bucket
         return await self._post_json("/v1/r2/put", request_payload)
+
+    async def upload_file(
+        self,
+        *,
+        guild_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+        bucket: str | None = None,
+        guild_quota_mb: float | None = None,
+    ) -> dict[str, Any]:
+        """Upload a file to R2 under {guild_id}/files/{filename}."""
+        request_payload: dict[str, Any] = {
+            "key": filename,
+            "guild_id": guild_id,
+            "upload_type": "files",
+            "body_b64": base64.b64encode(data).decode("ascii"),
+            "content_type": content_type,
+        }
+        if bucket:
+            request_payload["bucket"] = bucket
+        if guild_quota_mb is not None:
+            request_payload["guild_quota_mb"] = guild_quota_mb
+        return await self._post_json("/v1/r2/put", request_payload)
+
+    async def upload_avatar(
+        self,
+        *,
+        guild_id: str,
+        user_id: str,
+        data: bytes,
+        ext: str = "webp",
+        bucket: str | None = None,
+        guild_quota_mb: float | None = None,
+    ) -> dict[str, Any]:
+        """Upload a user avatar to R2 under {guild_id}/avatars/{user_id}.{ext}."""
+        request_payload: dict[str, Any] = {
+            "key": f"{user_id}.{ext}",
+            "guild_id": guild_id,
+            "upload_type": "avatars",
+            "body_b64": base64.b64encode(data).decode("ascii"),
+            "content_type": f"image/{ext}",
+        }
+        if bucket:
+            request_payload["bucket"] = bucket
+        if guild_quota_mb is not None:
+            request_payload["guild_quota_mb"] = guild_quota_mb
+        return await self._post_json("/v1/r2/put", request_payload)
+
+    async def get_usage(self) -> dict[str, Any]:
+        """Return total R2 usage and lock status from daemon."""
+        return await self._get_json("/v1/r2/usage")
+
+    async def get_guild_usage(self, guild_id: str) -> dict[str, Any]:
+        """Return R2 usage for a specific guild."""
+        return await self._post_json("/v1/r2/guild-usage", {"guild_id": guild_id})
 
 
 def get_daemon_bridge() -> DaemonBridge:
