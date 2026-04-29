@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,11 @@ import boto3
 from aiohttp import web
 from botocore.config import Config
 from dotenv import load_dotenv
+
+# Support both `python -m daemon.app` and `python daemon/app.py`.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 try:
     # When running with: python -m daemon.app
