@@ -34,18 +34,34 @@ def ensure_daemon_db_initialized(db_path: str) -> dict:
             """
             CREATE TABLE IF NOT EXISTS r2_upload_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT,
+                upload_type TEXT,
                 object_key TEXT NOT NULL,
+                original_name TEXT NOT NULL,
                 content_type TEXT NOT NULL,
                 content_length INTEGER NOT NULL,
                 etag TEXT,
+                deleted_at TEXT,
                 uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """
         )
+        migrations = [
+            "ALTER TABLE r2_upload_logs ADD COLUMN guild_id TEXT",
+            "ALTER TABLE r2_upload_logs ADD COLUMN upload_type TEXT",
+            "ALTER TABLE r2_upload_logs ADD COLUMN original_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE r2_upload_logs ADD COLUMN deleted_at TEXT",
+        ]
+        for migration in migrations:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.execute(
             """
             INSERT INTO daemon_meta (key, value)
-            VALUES ('schema_version', '1')
+            VALUES ('schema_version', '2')
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at = datetime('now')
@@ -56,5 +72,5 @@ def ensure_daemon_db_initialized(db_path: str) -> dict:
     return {
         "ok": True,
         "db_path": str(path),
-        "schema_version": "1",
+        "schema_version": "2",
     }

@@ -699,7 +699,39 @@ async function pageDeveloper(el) {
     }
     console.log('[pageDeveloper] stat ready:', stat);
 
+    let quotaState = { default_quota_mb: 100, guild: null };
+    try {
+      const query = S.guild ? `?gid=${encodeURIComponent(S.guild)}` : '';
+      quotaState = await api(`/api/dev/r2-quota${query}`);
+    } catch (quotaErr) {
+      console.debug('dev r2 quota unavailable', quotaErr);
+    }
+
     let html = `<div class="page-header"><h2>⚙️ 開發者面板</h2><button class="btn btn-ghost btn-sm" onclick="navigate('developer')">↻ 重新整理</button></div>`;
+
+    html += `
+    <div class="section">
+      <div class="section-title">☁️ R2 配額控制</div>
+      <p style="margin:.1rem 0 .7rem;color:var(--text-3);font-size:.85rem;line-height:1.6">
+        所有伺服器預設上限為 100 MB，可在這裡調整全域預設，或覆寫目前選取伺服器的額度。
+      </p>
+      <div style="display:grid;gap:.8rem">
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap;align-items:center">
+          <label style="font-size:.82rem;color:var(--text-3);min-width:110px">預設配額</label>
+          <input id="devR2DefaultQuota" class="form-input" type="number" min="1" step="1" style="max-width:160px" value="${esc(String(quotaState.default_quota_mb || 100))}">
+          <span style="font-size:.82rem;color:var(--text-3)">MB</span>
+          <button class="btn btn-primary btn-sm" id="devR2DefaultSave">更新預設</button>
+        </div>
+        <div style="display:flex;gap:.55rem;flex-wrap:wrap;align-items:center">
+          <label style="font-size:.82rem;color:var(--text-3);min-width:110px">目前伺服器</label>
+          <input id="devR2GuildQuota" class="form-input" type="number" min="1" step="1" style="max-width:160px" value="${esc(String(quotaState.guild?.quota_mb || quotaState.default_quota_mb || 100))}" ${S.guild ? '' : 'disabled'}>
+          <span style="font-size:.82rem;color:var(--text-3)">MB</span>
+          <button class="btn btn-primary btn-sm" id="devR2GuildSave" ${S.guild ? '' : 'disabled'}>覆寫目前伺服器</button>
+          <button class="btn btn-ghost btn-sm" id="devR2GuildClear" ${S.guild ? '' : 'disabled'}>清除覆寫</button>
+        </div>
+      </div>
+      <div id="devR2QuotaResult" style="margin-top:.65rem;font-size:.82rem;color:var(--text-3)">—</div>
+    </div>`;
 
     // ── Reload 控制 ──────────────────────────────────────
     html += `
@@ -820,9 +852,19 @@ async function pageDeveloper(el) {
     el.querySelector('#devReloadAll')?.addEventListener('click', async () => {
       await _devReload(el, '');
     });
+    el.querySelector('#devR2DefaultSave')?.addEventListener('click', async () => {
+      await _devSetDefaultQuota(el);
+    });
+    el.querySelector('#devR2GuildSave')?.addEventListener('click', async () => {
+      await _devSetGuildQuota(el);
+    });
+    el.querySelector('#devR2GuildClear')?.addEventListener('click', async () => {
+      await _devClearGuildQuota(el);
+    });
     el.querySelector('#devCommitCurrent')?.addEventListener('click', async () => {
       await _devCommitCurrent(el);
     });
+    _devRenderR2Quota(el, quotaState);
     console.log('[pageDeveloper] Done!');
 
   } catch (e) {
@@ -1058,6 +1100,93 @@ async function _devCommitCurrent(el) {
   }
 
   if (btn) btn.disabled = false;
+}
+
+function _devRenderR2Quota(el, data) {
+  const resultEl = el.querySelector('#devR2QuotaResult');
+  const guild = data?.guild || null;
+  const defaultQuota = Number(data?.default_quota_mb || 100);
+  const guildQuota = Number(guild?.quota_mb || defaultQuota);
+  const defaultInput = el.querySelector('#devR2DefaultQuota');
+  const guildInput = el.querySelector('#devR2GuildQuota');
+  if (defaultInput) defaultInput.value = String(defaultQuota);
+  if (guildInput) guildInput.value = String(guildQuota);
+  if (resultEl) {
+    if (!S.guild) {
+      resultEl.textContent = `預設 ${defaultQuota.toFixed(0)} MB，目前未選取伺服器。`;
+      return;
+    }
+    const mode = guild?.is_override ? '目前伺服器使用覆寫配額' : '目前伺服器沿用預設配額';
+    resultEl.textContent = `${mode}：${guildQuota.toFixed(0)} MB（預設 ${defaultQuota.toFixed(0)} MB）`;
+  }
+}
+
+async function _devRefreshR2Quota(el) {
+  const query = S.guild ? `?gid=${encodeURIComponent(S.guild)}` : '';
+  const data = await api(`/api/dev/r2-quota${query}`);
+  _devRenderR2Quota(el, data);
+  return data;
+}
+
+async function _devSetDefaultQuota(el) {
+  const input = el.querySelector('#devR2DefaultQuota');
+  const quota = Number(input?.value || 0);
+  if (!Number.isFinite(quota) || quota <= 0) {
+    toast('請輸入有效的預設配額', 'error');
+    input?.focus();
+    return;
+  }
+  try {
+    const res = await api('/api/dev/r2-quota', {
+      method: 'PUT',
+      body: JSON.stringify({ scope: 'default', quota_mb: quota }),
+    });
+    await _devRefreshR2Quota(el);
+    toast(res.message || '預設配額已更新', 'success');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function _devSetGuildQuota(el) {
+  if (!S.guild) {
+    toast('請先選取伺服器', 'error');
+    return;
+  }
+  const input = el.querySelector('#devR2GuildQuota');
+  const quota = Number(input?.value || 0);
+  if (!Number.isFinite(quota) || quota <= 0) {
+    toast('請輸入有效的伺服器配額', 'error');
+    input?.focus();
+    return;
+  }
+  try {
+    const res = await api('/api/dev/r2-quota', {
+      method: 'PUT',
+      body: JSON.stringify({ scope: 'guild', guild_id: S.guild, quota_mb: quota }),
+    });
+    await _devRefreshR2Quota(el);
+    toast(res.message || '伺服器配額已更新', 'success');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function _devClearGuildQuota(el) {
+  if (!S.guild) {
+    toast('請先選取伺服器', 'error');
+    return;
+  }
+  try {
+    const res = await api('/api/dev/r2-quota', {
+      method: 'PUT',
+      body: JSON.stringify({ scope: 'clear', guild_id: S.guild }),
+    });
+    await _devRefreshR2Quota(el);
+    toast(res.message || '伺服器配額已恢復預設', 'success');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 let _devRlTick = 0;

@@ -145,6 +145,29 @@ _TABLES_DDL: list[str] = [
     )
     """,
     # ------------------------------------------------------------------
+    # app_settings — global runtime settings
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        setting_key   TEXT PRIMARY KEY,
+        setting_value TEXT,
+        updated_by    TEXT,
+        updated_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+    )
+    """,
+    # ------------------------------------------------------------------
+    # guild_r2_settings — per-guild R2 quota overrides
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS guild_r2_settings (
+        guild_id           TEXT PRIMARY KEY,
+        quota_mb           REAL,
+        updated_by         TEXT,
+        updated_at         INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        FOREIGN KEY (guild_id) REFERENCES guilds (guild_id) ON DELETE CASCADE
+    )
+    """,
+    # ------------------------------------------------------------------
     # recovery_requests — recovery approval workflow
     # ------------------------------------------------------------------
     """

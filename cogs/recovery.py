@@ -33,7 +33,6 @@ logger = setup_logger(__name__)
 _RECOVERY_LOOKBACK = 300  # seconds (5 minutes)
 _WEBHOOK_NAME = "SleepBot Recovery"
 _MAX_RESTORE_MESSAGES = 100
-_FILE_RESTORE_UNSUPPORTED_TEXT = "暫不支持還原"
 
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
@@ -2088,7 +2087,7 @@ class RecoveryCog(commands.Cog, name="Recovery"):
             if safe_content.strip():
                 lines.append(safe_content)
             for name in attachment_names:
-                lines.append(f"[{name}] {_FILE_RESTORE_UNSUPPORTED_TEXT}")
+                lines.append(name)
 
             if not lines:
                 lines.append("[空白訊息]")

@@ -13,13 +13,14 @@ import asyncio
 import base64
 import json
 import os
+import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 import boto3
-import time
 from aiohttp import web
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -45,6 +46,83 @@ logger = setup_logger("daemon.r2_guardian")
 
 _BYTES_PER_GB = 1024 ** 3
 _DEFAULT_GLOBAL_QUOTA_GB = 10
+
+
+def _connect_meta_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _basename_from_key(key: str) -> str:
+    return key.rsplit("/", 1)[-1] if "/" in key else key
+
+
+def _record_upload_log(
+    db_path: str,
+    *,
+    guild_id: str,
+    upload_type: str,
+    object_key: str,
+    original_name: str,
+    content_type: str,
+    content_length: int,
+    etag: str | None,
+) -> None:
+    with _connect_meta_db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO r2_upload_logs (
+                guild_id,
+                upload_type,
+                object_key,
+                original_name,
+                content_type,
+                content_length,
+                etag,
+                deleted_at,
+                uploaded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
+            """,
+            [
+                guild_id or None,
+                upload_type or None,
+                object_key,
+                original_name,
+                content_type,
+                content_length,
+                etag,
+            ],
+        )
+        conn.commit()
+
+
+def _mark_upload_deleted(db_path: str, object_key: str) -> None:
+    with _connect_meta_db(db_path) as conn:
+        conn.execute(
+            "UPDATE r2_upload_logs SET deleted_at = datetime('now') WHERE object_key = ?",
+            [object_key],
+        )
+        conn.commit()
+
+
+def _load_name_map(db_path: str, guild_id: str) -> dict[str, str]:
+    with _connect_meta_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT object_key, original_name
+            FROM r2_upload_logs
+            WHERE guild_id = ?
+            ORDER BY id DESC
+            """,
+            [guild_id],
+        ).fetchall()
+    name_map: dict[str, str] = {}
+    for row in rows:
+        object_key = str(row["object_key"])
+        if object_key not in name_map and row["original_name"]:
+            name_map[object_key] = str(row["original_name"])
+    return name_map
 
 
 def _required_env(name: str) -> str:
@@ -344,6 +422,21 @@ async def put_object(request: web.Request) -> web.Response:
 
     uploaded = await asyncio.to_thread(_upload)
 
+    try:
+        await asyncio.to_thread(
+            _record_upload_log,
+            request.app["daemon_meta_db_path"],
+            guild_id=guild_id,
+            upload_type=upload_type,
+            object_key=key,
+            original_name=raw_key,
+            content_type=content_type,
+            content_length=len(data),
+            etag=uploaded.get("etag"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to record R2 upload log key=%s: %s", key, exc)
+
     # Background global quota check after every upload (non-blocking)
     asyncio.create_task(qm.check_and_enforce_global_quota())
 
@@ -355,6 +448,101 @@ async def put_object(request: web.Request) -> web.Response:
             "content_type": content_type,
             "bytes": len(data),
             **uploaded,
+        }
+    )
+
+
+async def list_objects(request: web.Request) -> web.Response:
+    payload = await request.json()
+    guild_id = str(payload.get("guild_id", "")).strip()
+    upload_type = str(payload.get("upload_type", "files")).strip() or "files"
+    try:
+        limit = max(1, min(100, int(payload.get("limit", 20))))
+    except (TypeError, ValueError):
+        limit = 20
+    if not guild_id:
+        return web.json_response({"ok": False, "error": "guild_id is required"}, status=400)
+
+    prefix = f"{guild_id}/"
+    if upload_type != "all":
+        prefix = f"{guild_id}/{upload_type}/"
+
+    s3 = request.app["s3_client"]
+    bucket = request.app["r2_bucket"]
+    name_map = await asyncio.to_thread(_load_name_map, request.app["daemon_meta_db_path"], guild_id)
+
+    def _list() -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        while True:
+            resp = s3.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents", []):
+                key = str(obj.get("Key") or "")
+                if not key:
+                    continue
+                last_modified = obj.get("LastModified")
+                parts = key.split("/", 2)
+                items.append(
+                    {
+                        "key": key,
+                        "name": name_map.get(key) or _basename_from_key(key),
+                        "size_bytes": int(obj.get("Size") or 0),
+                        "last_modified": last_modified.isoformat() if last_modified else None,
+                        "upload_type": parts[1] if len(parts) >= 2 else upload_type,
+                    }
+                )
+            if not resp.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+        items.sort(key=lambda item: (-item["size_bytes"], item["name"].lower()))
+        return items[:limit]
+
+    try:
+        items = await asyncio.to_thread(_list)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to list R2 objects guild=%s prefix=%s: %s", guild_id, prefix, exc)
+        return web.json_response({"ok": False, "error": "list_failed"}, status=500)
+
+    return web.json_response(
+        {
+            "ok": True,
+            "guild_id": guild_id,
+            "upload_type": upload_type,
+            "objects": items,
+        }
+    )
+
+
+async def delete_object(request: web.Request) -> web.Response:
+    payload = await request.json()
+    guild_id = str(payload.get("guild_id", "")).strip()
+    object_key = str(payload.get("object_key", "")).strip()
+    if not guild_id:
+        return web.json_response({"ok": False, "error": "guild_id is required"}, status=400)
+    if not object_key:
+        return web.json_response({"ok": False, "error": "object_key is required"}, status=400)
+    if not object_key.startswith(f"{guild_id}/"):
+        return web.json_response({"ok": False, "error": "object_key not in guild scope"}, status=403)
+
+    s3 = request.app["s3_client"]
+    bucket = request.app["r2_bucket"]
+
+    def _delete() -> None:
+        s3.delete_object(Bucket=bucket, Key=object_key)
+
+    try:
+        await asyncio.to_thread(_delete)
+        await asyncio.to_thread(_mark_upload_deleted, request.app["daemon_meta_db_path"], object_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to delete R2 object key=%s: %s", object_key, exc, exc_info=True)
+        return web.json_response({"ok": False, "error": "delete_failed"}, status=500)
+
+    return web.json_response(
+        {
+            "ok": True,
+            "guild_id": guild_id,
+            "object_key": object_key,
+            "name": _basename_from_key(object_key),
         }
     )
 
@@ -385,6 +573,8 @@ def create_app() -> web.Application:
     app.router.add_get("/v1/r2/usage", get_usage)
     app.router.add_post("/v1/r2/guild-usage", get_guild_usage)
     app.router.add_post("/v1/r2/put", put_object)
+    app.router.add_post("/v1/r2/list", list_objects)
+    app.router.add_post("/v1/r2/delete", delete_object)
 
     return app
 

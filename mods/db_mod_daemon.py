@@ -176,6 +176,33 @@ class DaemonBridge:
         """Return R2 usage for a specific guild."""
         return await self._post_json("/v1/r2/guild-usage", {"guild_id": guild_id})
 
+    async def list_guild_objects(
+        self,
+        *,
+        guild_id: str,
+        upload_type: str = "files",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return current R2 objects for a guild, sorted by size descending."""
+        return await self._post_json(
+            "/v1/r2/list",
+            {
+                "guild_id": guild_id,
+                "upload_type": upload_type,
+                "limit": limit,
+            },
+        )
+
+    async def delete_guild_object(self, *, guild_id: str, object_key: str) -> dict[str, Any]:
+        """Delete a guild-scoped R2 object by its canonical object key."""
+        return await self._post_json(
+            "/v1/r2/delete",
+            {
+                "guild_id": guild_id,
+                "object_key": object_key,
+            },
+        )
+
 
 def get_daemon_bridge() -> DaemonBridge:
     return DaemonBridge()

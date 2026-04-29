@@ -45,6 +45,14 @@ from mods.defense import (
     set_defense_enabled,
 )
 from mods.logger import setup_logger
+from mods.r2_settings import (
+    clear_guild_quota_override,
+    ensure_guild_registered,
+    get_default_guild_quota_mb,
+    get_guild_quota_details,
+    set_default_guild_quota_mb,
+    set_guild_quota_mb,
+)
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
@@ -1592,6 +1600,98 @@ async def _api_dev_info(req: web.Request) -> web.Response:
 
 
 @_require_developer
+async def _api_dev_r2_quota_get(req: web.Request) -> web.Response:
+    """回傳 R2 預設配額與指定 guild 的覆寫狀態。"""
+    gid = str(req.query.get("gid") or "").strip()
+    payload: dict[str, Any] = {
+        "success": True,
+        "default_quota_mb": await get_default_guild_quota_mb(),
+    }
+    if gid:
+        payload["guild"] = {
+            "guild_id": gid,
+            **(await get_guild_quota_details(gid)),
+        }
+    return web.json_response(payload)
+
+
+@_require_developer
+async def _api_dev_r2_quota_set(req: web.Request) -> web.Response:
+    """更新 R2 預設配額或指定 guild 的覆寫。"""
+    try:
+        body = await req.json()
+    except Exception:
+        return web.json_response({"error": "無效的 JSON"}, status=400)
+
+    scope = str(body.get("scope") or "").strip().lower()
+    actor_id = str(req["s"].get("id") or "")
+
+    try:
+        if scope == "default":
+            quota_mb = float(body.get("quota_mb"))
+            if quota_mb <= 0:
+                return web.json_response({"error": "quota_mb 必須大於 0"}, status=400)
+            await set_default_guild_quota_mb(quota_mb, actor_id)
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": f"預設 R2 配額已更新為 {quota_mb:.0f} MB",
+                    "default_quota_mb": quota_mb,
+                }
+            )
+
+        gid = str(body.get("guild_id") or "").strip()
+        if not gid:
+            return web.json_response({"error": "guild_id 為必填"}, status=400)
+
+        bot: commands.Bot = req.app["bot"]
+        guild = bot.get_guild(int(gid)) if gid.isdigit() else None
+        if guild is None:
+            return web.json_response({"error": "找不到該伺服器"}, status=404)
+
+        await ensure_guild_registered(
+            str(guild.id),
+            guild.name,
+            str(guild.owner_id) if guild.owner_id else "0",
+        )
+
+        if scope == "guild":
+            quota_mb = float(body.get("quota_mb"))
+            if quota_mb <= 0:
+                return web.json_response({"error": "quota_mb 必須大於 0"}, status=400)
+            await set_guild_quota_mb(str(guild.id), quota_mb, actor_id)
+            details = await get_guild_quota_details(str(guild.id))
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": f"{guild.name} 的 R2 配額已設為 {quota_mb:.0f} MB",
+                    "guild": {
+                        "guild_id": str(guild.id),
+                        **details,
+                    },
+                }
+            )
+
+        if scope == "clear":
+            await clear_guild_quota_override(str(guild.id))
+            details = await get_guild_quota_details(str(guild.id))
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": f"{guild.name} 已恢復使用預設配額",
+                    "guild": {
+                        "guild_id": str(guild.id),
+                        **details,
+                    },
+                }
+            )
+    except (TypeError, ValueError):
+        return web.json_response({"error": "quota_mb 必須是數字"}, status=400)
+
+    return web.json_response({"error": "不支援的 scope"}, status=400)
+
+
+@_require_developer
 async def _api_dev_reload(req: web.Request) -> web.Response:
     """從 Web 端觸發 cog reload（開發者限定）。
     
@@ -1782,6 +1882,8 @@ class WebCog(commands.Cog, name="Web"):
         r.add_get("/api/dev/ratelimit-stats", _api_dev_ratelimit_stats)
         r.add_get("/api/dev/system-stats", _api_dev_system_stats)
         r.add_get("/api/dev/info", _api_dev_info)
+        r.add_get("/api/dev/r2-quota", _api_dev_r2_quota_get)
+        r.add_put("/api/dev/r2-quota", _api_dev_r2_quota_set)
         r.add_post("/api/dev/reload", _api_dev_reload)
         r.add_post("/api/dev/guilds/{gid}/commit", _api_dev_commit)
 

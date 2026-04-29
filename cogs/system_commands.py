@@ -24,6 +24,14 @@ from mods.defense import (
     set_defense_enabled,
 )
 from mods.logger import setup_logger
+from mods.r2_settings import (
+    clear_guild_quota_override,
+    ensure_guild_registered,
+    get_default_guild_quota_mb,
+    get_guild_quota_details,
+    set_default_guild_quota_mb,
+    set_guild_quota_mb,
+)
 from mods.storage import get_storage
 
 logger = setup_logger(__name__)
@@ -387,6 +395,89 @@ class DevCommandsCog(commands.Cog, name="DevCommands"):
 
     def _is_developer(self, user_id: int) -> bool:
         return str(user_id) in _DEV_IDS
+
+    @commands.command(name="r2quota", hidden=True)
+    async def dev_r2quota(self, ctx: commands.Context, scope: str, value: str | None = None, guild_id: int | None = None) -> None:
+        """>>r2quota <default|guild|clear|show> [value] [guild_id]
+        動態調整 R2 預設配額，或細調單一伺服器配額。
+        """
+        if not self._is_developer(ctx.author.id):
+            await ctx.message.add_reaction("🚫")
+            return
+
+        scope = scope.strip().lower()
+        target_guild = None
+        if guild_id is not None:
+            target_guild = self.bot.get_guild(guild_id)
+
+        try:
+            if scope == "default":
+                if value is None:
+                    current = await get_default_guild_quota_mb()
+                    await ctx.reply(f"目前預設 R2 配額：{current:.0f} MB")
+                    return
+                quota_mb = float(value)
+                if quota_mb <= 0:
+                    await ctx.reply("❌ 配額必須大於 0 MB。")
+                    return
+                await set_default_guild_quota_mb(quota_mb, str(ctx.author.id))
+                await ctx.reply(f"✅ 已更新預設 R2 配額為 {quota_mb:.0f} MB。")
+                return
+
+            if scope == "show":
+                if guild_id is None:
+                    await ctx.reply("❌ show 需要指定 guild_id。")
+                    return
+                if target_guild is None:
+                    await ctx.reply(f"❌ 找不到伺服器 `{guild_id}`。")
+                    return
+                details = await get_guild_quota_details(str(guild_id))
+                mode = "覆寫" if details["is_override"] else "沿用預設"
+                await ctx.reply(
+                    f"伺服器 **{target_guild.name}** R2 配額：{float(details['quota_mb']):.0f} MB\n"
+                    f"模式：{mode}（預設 {float(details['default_quota_mb']):.0f} MB）"
+                )
+                return
+
+            if scope == "guild":
+                if guild_id is None or value is None:
+                    await ctx.reply("❌ guild 需要 value 與 guild_id。")
+                    return
+                if target_guild is None:
+                    await ctx.reply(f"❌ 找不到伺服器 `{guild_id}`。")
+                    return
+                quota_mb = float(value)
+                if quota_mb <= 0:
+                    await ctx.reply("❌ 配額必須大於 0 MB。")
+                    return
+                await ensure_guild_registered(
+                    str(target_guild.id),
+                    target_guild.name,
+                    str(target_guild.owner_id) if target_guild.owner_id else "0",
+                )
+                await set_guild_quota_mb(str(target_guild.id), quota_mb, str(ctx.author.id))
+                await ctx.reply(
+                    f"✅ 已將 **{target_guild.name}** 的 R2 配額設為 {quota_mb:.0f} MB。"
+                )
+                return
+
+            if scope == "clear":
+                if guild_id is None:
+                    await ctx.reply("❌ clear 需要 guild_id。")
+                    return
+                await clear_guild_quota_override(str(guild_id))
+                current = await get_guild_quota_details(str(guild_id))
+                await ctx.reply(
+                    f"✅ 已清除伺服器 `{guild_id}` 的覆寫配額，現在回到 {float(current['quota_mb']):.0f} MB。"
+                )
+                return
+
+            await ctx.reply("❌ 用法：>>r2quota <default|guild|clear|show> [value] [guild_id]")
+        except ValueError:
+            await ctx.reply("❌ 配額必須是數字。")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("dev_r2quota failed by=%s scope=%s value=%s guild_id=%s: %s", ctx.author.id, scope, value, guild_id, exc, exc_info=True)
+            await ctx.reply("❌ R2 配額更新失敗。")
 
     @commands.command(name="unban", hidden=True)
     async def dev_unban(self, ctx: commands.Context, user_id: int, guild_id: int | None = None) -> None:

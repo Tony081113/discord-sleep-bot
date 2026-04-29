@@ -473,6 +473,25 @@ class MonitoringCog(commands.Cog, name="Monitoring"):
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to store message %s: %s", message.id, exc)
 
+            if attachment_names:
+                try:
+                    await message.reply("❌", mention_author=False)
+                except discord.Forbidden:
+                    logger.debug(
+                        "Cannot reply rejection mark guild=%s channel=%s message=%s",
+                        guild_id,
+                        message.channel.id,
+                        message.id,
+                    )
+                except discord.HTTPException as exc:
+                    logger.debug(
+                        "Reply rejection mark failed guild=%s channel=%s message=%s: %s",
+                        guild_id,
+                        message.channel.id,
+                        message.id,
+                        exc,
+                    )
+
         # 訊息保存後檢查是否命中轟炸門檻。
         # 防禦流程任何例外都不應中斷 on_message 主事件。
         try:
