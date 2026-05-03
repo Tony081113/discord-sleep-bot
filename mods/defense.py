@@ -1,0 +1,210 @@
+"""防禦系統狀態管理工具。"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from mods.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+DEFAULT_DISABLE_SECONDS = 3600
+MIN_DISABLE_SECONDS = 60
+MAX_DISABLE_SECONDS = 86400
+
+
+class DefenseStorageError(RuntimeError):
+    """Raised when defense state cannot be persisted to storage."""
+
+
+def _normalize_duration(duration_seconds: int) -> int:
+    """將停用秒數限制在安全範圍。"""
+    return max(MIN_DISABLE_SECONDS, min(MAX_DISABLE_SECONDS, duration_seconds))
+
+
+def _to_bool(value: Any, default: bool = True) -> bool:
+    """將資料庫值安全轉為布林，避免字串 '0' 被誤判為 True。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    """將資料庫值安全轉為 int；無法解析則回傳 None。"""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def get_defense_state(store, guild_id: str) -> dict[str, Any]:
+    """取得防禦狀態；若逾時則自動恢復並回傳最新狀態。"""
+    try:
+        rows = await store.fetchall(
+            "SELECT is_enabled, disabled_until FROM guild_defense_state WHERE guild_id = ?",
+            [guild_id],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to read defense state guild=%s: %s",
+            guild_id,
+            exc,
+            exc_info=True,
+        )
+        # Fail-safe: keep defense enabled if state backend is unavailable.
+        return {
+            "enabled": True,
+            "disabled_until": None,
+            "remaining_seconds": 0,
+            "auto_restored": False,
+        }
+
+    if not rows:
+        return {
+            "enabled": True,
+            "disabled_until": None,
+            "remaining_seconds": 0,
+            "auto_restored": False,
+        }
+
+    row = rows[0]
+    enabled = _to_bool(row.get("is_enabled", 1), default=True)
+    disabled_until = _to_int_or_none(row.get("disabled_until"))
+    now = int(time.time())
+
+    if not enabled and disabled_until is not None:
+        if now >= disabled_until:
+            await store.execute(
+                "UPDATE guild_defense_state "
+                "SET is_enabled = 1, disabled_until = NULL, updated_by = ?, "
+                "updated_at = strftime('%s','now') "
+                "WHERE guild_id = ?",
+                ["system:auto_restore", guild_id],
+            )
+            logger.info("Defense auto-restored guild=%s", guild_id)
+            return {
+                "enabled": True,
+                "disabled_until": None,
+                "remaining_seconds": 0,
+                "auto_restored": True,
+            }
+
+        return {
+            "enabled": False,
+            "disabled_until": disabled_until,
+            "remaining_seconds": max(0, disabled_until - now),
+            "auto_restored": False,
+        }
+
+    if not enabled and disabled_until is None:
+        # 舊資料或異常資料可能缺少 disabled_until，避免永久停用造成防禦失靈。
+        await store.execute(
+            "UPDATE guild_defense_state "
+            "SET is_enabled = 1, disabled_until = NULL, updated_by = ?, "
+            "updated_at = strftime('%s','now') "
+            "WHERE guild_id = ?",
+            ["system:auto_restore_invalid_state", guild_id],
+        )
+        logger.warning(
+            "Defense state had no disabled_until while disabled; auto-restored guild=%s",
+            guild_id,
+        )
+        return {
+            "enabled": True,
+            "disabled_until": None,
+            "remaining_seconds": 0,
+            "auto_restored": True,
+        }
+
+    return {
+        "enabled": enabled,
+        "disabled_until": None,
+        "remaining_seconds": 0,
+        "auto_restored": False,
+    }
+
+
+async def set_defense_disabled(
+    store,
+    guild_id: str,
+    updated_by: str,
+    duration_seconds: int = DEFAULT_DISABLE_SECONDS,
+) -> dict[str, Any]:
+    """停用防禦系統一段時間。"""
+    duration = _normalize_duration(duration_seconds)
+    disabled_until = int(time.time()) + duration
+
+    try:
+        await store.execute(
+            "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
+            "VALUES (?, 0, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "is_enabled = 0, disabled_until = excluded.disabled_until, "
+            "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
+            [guild_id, disabled_until, updated_by],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to disable defense guild=%s by=%s: %s",
+            guild_id,
+            updated_by,
+            exc,
+            exc_info=True,
+        )
+        raise DefenseStorageError("failed to disable defense") from exc
+
+    logger.warning(
+        "Defense disabled guild=%s by=%s until=%s duration=%s",
+        guild_id,
+        updated_by,
+        disabled_until,
+        duration,
+    )
+    return {
+        "enabled": False,
+        "disabled_until": disabled_until,
+        "remaining_seconds": duration,
+        "auto_restored": False,
+    }
+
+
+async def set_defense_enabled(store, guild_id: str, updated_by: str) -> dict[str, Any]:
+    """立即啟用防禦系統。"""
+    try:
+        await store.execute(
+            "INSERT INTO guild_defense_state (guild_id, is_enabled, disabled_until, updated_by) "
+            "VALUES (?, 1, NULL, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "is_enabled = 1, disabled_until = NULL, "
+            "updated_by = excluded.updated_by, updated_at = strftime('%s','now')",
+            [guild_id, updated_by],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Failed to enable defense guild=%s by=%s: %s",
+            guild_id,
+            updated_by,
+            exc,
+            exc_info=True,
+        )
+        raise DefenseStorageError("failed to enable defense") from exc
+
+    logger.info("Defense enabled guild=%s by=%s", guild_id, updated_by)
+    return {
+        "enabled": True,
+        "disabled_until": None,
+        "remaining_seconds": 0,
+        "auto_restored": False,
+    }
