@@ -6,6 +6,18 @@
 // ── State ────────────────────────────────────────────────
 const S = { user: null, guild: null, page: 'overview' };
 
+const PREVIEW = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const raw = (params.get('preview') || params.get('mock') || '').trim().toLowerCase();
+  const enabled = ['1', 'true', 'yes', 'on'].includes(raw);
+  const page = params.get('page') || 'overview';
+  const allowedPages = new Set(['overview', 'recovery', 'thresholds', 'developer']);
+  return {
+    enabled,
+    page: allowedPages.has(page) ? page : 'overview',
+  };
+})();
+
 const EVENT_LABELS = {
   channel_delete:    { icon: '🗑️', label: '頻道刪除',       cls: 'delete' },
   channel_update:    { icon: '✏️', label: '頻道修改',       cls: 'update' },
@@ -31,6 +43,323 @@ const ERRORS = [
 ];
 
 let _consoleSafetyWarned = false;
+
+const PREVIEW_NOW = Math.floor(Date.now() / 1000);
+const PREVIEW_GUILDS = [
+  { id: 'guild-night-shift', name: '午夜值班站' },
+  { id: 'guild-dream-watch', name: 'Dream Watch' },
+  { id: 'guild-bot-only', name: 'Bot Sandbox' },
+];
+
+const PREVIEW_DB = {
+  user: {
+    id: 'preview-user-1',
+    username: 'Tony Preview',
+    avatar: '',
+    is_developer: true,
+    guilds: PREVIEW_GUILDS.slice(0, 2),
+    guild_groups: {
+      mine: [PREVIEW_GUILDS[0]],
+      other_approved: [PREVIEW_GUILDS[1]],
+      bot_only: [PREVIEW_GUILDS[2]],
+      all: PREVIEW_GUILDS,
+    },
+  },
+  overview: {
+    channels: 42,
+    roles: 17,
+    events_24h: 9,
+    pending_recoveries: 2,
+  },
+  events: {
+    events: [
+      { event_type: 'channel_delete', target_id: '122334455667788990', timestamp: PREVIEW_NOW - 420 },
+      { event_type: 'admin_perm_remove', target_id: '998877665544332211', timestamp: PREVIEW_NOW - 1800 },
+      { event_type: 'message_spam', target_id: 'chan-general', timestamp: PREVIEW_NOW - 5400 },
+      { event_type: 'role_update', target_id: 'mod-role', timestamp: PREVIEW_NOW - 8600 },
+    ],
+  },
+  maintenanceLogs: {
+    logs: [
+      { author_name: 'Tony', created_at: PREVIEW_NOW - 900, content: '把異常門檻從 3 調到 5，避免半夜誤報。' },
+      { author_name: 'SleepBot', created_at: PREVIEW_NOW - 7200, content: '完成最近一次防禦狀態同步。' },
+    ],
+  },
+  recoveryRequests: {
+    requests: [
+      {
+        id: 'req-001',
+        event_type: 'channel_delete',
+        event_count: 3,
+        status: 'pending',
+        created_at: PREVIEW_NOW - 820,
+      },
+      {
+        id: 'req-002',
+        event_type: 'manual',
+        event_count: 1,
+        status: 'completed',
+        created_at: PREVIEW_NOW - 14400,
+        resolved_at: PREVIEW_NOW - 14320,
+        result_channels: 2,
+        result_roles: 1,
+        result_messages: 18,
+      },
+      {
+        id: 'req-003',
+        event_type: 'role_update',
+        event_count: 6,
+        status: 'rejected',
+        created_at: PREVIEW_NOW - 24800,
+        resolved_at: PREVIEW_NOW - 24700,
+        result_channels: 0,
+        result_roles: 0,
+        result_messages: 0,
+      },
+    ],
+  },
+  defense: {
+    defense: {
+      enabled: true,
+      remaining_seconds: 0,
+      disabled_until: null,
+    },
+  },
+  thresholds: {
+    thresholds: [
+      { event_type: 'channel_delete', label: '頻道刪除', value: 3, default: 3, window_seconds: 300, default_window_seconds: 300 },
+      { event_type: 'channel_update', label: '頻道修改', value: 5, default: 5, window_seconds: 300, default_window_seconds: 300 },
+      { event_type: 'role_delete', label: '身分組刪除', value: 3, default: 3, window_seconds: 300, default_window_seconds: 300 },
+      { event_type: 'admin_perm_remove', label: '管理員權限移除', value: 2, default: 2, window_seconds: 300, default_window_seconds: 300 },
+      { event_type: 'message_spam', label: '訊息轟炸', value: 8, default: 8, window_seconds: 10, default_window_seconds: 10 },
+    ],
+  },
+  devInfo: {
+    is_developer: true,
+  },
+  rateLimitStats: {
+    success: true,
+    stats: {
+      total_429s: 7,
+      by_scope: { low: 2, medium: 3, high: 2 },
+      by_limit_key: { 'POST /recovery/approve': 4, 'PUT /thresholds': 2, 'POST /defense/disable': 1 },
+      by_bucket: { 'uid:preview-user-1': 5, 'ip:127.0.0.1': 2 },
+    },
+  },
+  r2Quota: {
+    default_quota_mb: 100,
+    guild: {
+      quota_mb: 180,
+      is_override: true,
+    },
+  },
+};
+
+function clonePreview(data) {
+  return JSON.parse(JSON.stringify(data));
+}
+
+function parsePreviewBody(body) {
+  if (!body) return {};
+  if (typeof body === 'string') {
+    try {
+      return JSON.parse(body);
+    } catch (_) {
+      return {};
+    }
+  }
+  return body;
+}
+
+function buildPreviewSystemStats() {
+  const tick = Math.floor(Date.now() / 3000) % 6;
+  const cpu = 18 + tick * 4;
+  const ramUsed = 2760 + tick * 45;
+  const ramPercent = 42 + tick;
+  const procCpu = 3 + tick;
+  const procRam = 198 + tick * 3;
+  const sent = 18 * 1024 + tick * 3800;
+  const recv = 26 * 1024 + tick * 5200;
+  return {
+    success: true,
+    timestamp: Math.floor(Date.now() / 1000),
+    system: {
+      cpu_percent: cpu,
+      ram_used_mb: ramUsed,
+      ram_total_mb: 8192,
+      ram_percent: ramPercent,
+    },
+    process: {
+      cpu_percent: procCpu,
+      ram_mb: procRam,
+    },
+    network: {
+      bytes_sent_per_s: sent,
+      bytes_recv_per_s: recv,
+    },
+    redis: {
+      available: true,
+      used_memory_mb: 148.4,
+      maxmemory_mb: 512,
+      used_memory_percent: 29,
+    },
+    r2_usage: {
+      available: true,
+      total_quota_gb: 10,
+      current_quota_gb: 2.384,
+      remaining_quota_gb: 7.616,
+      locked: false,
+      lock_reason: '',
+    },
+  };
+}
+
+function previewApi(path, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  const url = new URL(path, window.location.origin);
+  const cleanPath = url.pathname;
+
+  if (cleanPath === '/api/me') {
+    return clonePreview(PREVIEW_DB.user);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/overview$/)) {
+    return clonePreview(PREVIEW_DB.overview);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/events$/)) {
+    return clonePreview(PREVIEW_DB.events);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/maintenance-logs$/)) {
+    if (method === 'POST') {
+      const payload = parsePreviewBody(opts.body);
+      PREVIEW_DB.maintenanceLogs.logs.unshift({
+        author_name: PREVIEW_DB.user.username,
+        created_at: Math.floor(Date.now() / 1000),
+        content: String(payload.content || '').trim() || '預覽模式新增的日誌',
+      });
+      return { success: true };
+    }
+    return clonePreview(PREVIEW_DB.maintenanceLogs);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/recovery-requests$/)) {
+    return clonePreview(PREVIEW_DB.recoveryRequests);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/defense-status$/)) {
+    return clonePreview(PREVIEW_DB.defense);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/recovery\/approve\/[^/]+$/)) {
+    const id = cleanPath.split('/').pop();
+    const req = PREVIEW_DB.recoveryRequests.requests.find(item => item.id === id);
+    if (req) {
+      req.status = 'completed';
+      req.resolved_at = Math.floor(Date.now() / 1000);
+      req.result_channels = 2;
+      req.result_roles = 1;
+      req.result_messages = 12;
+    }
+    return { channels: 2, roles: 1, messages: 12 };
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/recovery\/reject\/[^/]+$/)) {
+    const id = cleanPath.split('/').pop();
+    const req = PREVIEW_DB.recoveryRequests.requests.find(item => item.id === id);
+    if (req) {
+      req.status = 'rejected';
+      req.resolved_at = Math.floor(Date.now() / 1000);
+    }
+    return { success: true };
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/recovery\/manual$/)) {
+    PREVIEW_DB.recoveryRequests.requests.unshift({
+      id: `req-manual-${Date.now()}`,
+      event_type: 'manual',
+      event_count: 1,
+      status: 'completed',
+      created_at: Math.floor(Date.now() / 1000),
+      resolved_at: Math.floor(Date.now() / 1000),
+      result_channels: 3,
+      result_roles: 1,
+      result_messages: 24,
+    });
+    return { queued: false, channels: 3, roles: 1, messages: 24 };
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/thresholds$/)) {
+    if (method === 'PUT') {
+      const payload = parsePreviewBody(opts.body);
+      const next = payload.thresholds || {};
+      PREVIEW_DB.thresholds.thresholds.forEach(item => {
+        const updated = next[item.event_type];
+        if (updated) {
+          item.value = Number(updated.value || item.value);
+          item.window_seconds = Number(updated.window_seconds || item.window_seconds);
+        }
+      });
+      return { success: true };
+    }
+    return clonePreview(PREVIEW_DB.thresholds);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/defense\/disable$/)) {
+    const until = Math.floor(Date.now() / 1000) + 3600;
+    PREVIEW_DB.defense.defense.enabled = false;
+    PREVIEW_DB.defense.defense.remaining_seconds = 3600;
+    PREVIEW_DB.defense.defense.disabled_until = until;
+    return clonePreview(PREVIEW_DB.defense);
+  }
+  if (cleanPath.match(/^\/api\/guilds\/[^/]+\/defense\/enable$/)) {
+    PREVIEW_DB.defense.defense.enabled = true;
+    PREVIEW_DB.defense.defense.remaining_seconds = 0;
+    PREVIEW_DB.defense.defense.disabled_until = null;
+    return { success: true };
+  }
+  if (cleanPath === '/api/dev/info') {
+    return clonePreview(PREVIEW_DB.devInfo);
+  }
+  if (cleanPath === '/api/dev/ratelimit-stats') {
+    return clonePreview(PREVIEW_DB.rateLimitStats);
+  }
+  if (cleanPath === '/api/dev/r2-quota') {
+    if (method === 'PUT') {
+      const payload = parsePreviewBody(opts.body);
+      if (payload.scope === 'default' && Number(payload.quota_mb) > 0) {
+        PREVIEW_DB.r2Quota.default_quota_mb = Number(payload.quota_mb);
+        if (!PREVIEW_DB.r2Quota.guild.is_override) {
+          PREVIEW_DB.r2Quota.guild.quota_mb = Number(payload.quota_mb);
+        }
+      }
+      if (payload.scope === 'guild' && Number(payload.quota_mb) > 0) {
+        PREVIEW_DB.r2Quota.guild.quota_mb = Number(payload.quota_mb);
+        PREVIEW_DB.r2Quota.guild.is_override = true;
+      }
+      if (payload.scope === 'clear') {
+        PREVIEW_DB.r2Quota.guild.quota_mb = PREVIEW_DB.r2Quota.default_quota_mb;
+        PREVIEW_DB.r2Quota.guild.is_override = false;
+      }
+      return { message: '預覽配額已更新' };
+    }
+    return clonePreview(PREVIEW_DB.r2Quota);
+  }
+  if (cleanPath === '/api/dev/system-stats') {
+    return buildPreviewSystemStats();
+  }
+  if (cleanPath === '/api/dev/reload') {
+    const payload = parsePreviewBody(opts.body);
+    const cog = String(payload.cog || '').trim();
+    return {
+      ok: cog ? [cog] : ['cogs.monitoring', 'cogs.recovery', 'cogs.system_commands'],
+      failed: [],
+      skipped: cog ? [] : ['cogs.web'],
+    };
+  }
+  if (cleanPath.match(/^\/api\/dev\/guilds\/[^/]+\/commit$/)) {
+    return {
+      message: '預覽快照已建立',
+      channels: 42,
+      roles: 17,
+      members: 126,
+      snapshots_total: 9,
+    };
+  }
+
+  throw new Error(`Preview route not mocked: ${method} ${cleanPath}`);
+}
 
 function warnConsolePasteScam() {
   if (_consoleSafetyWarned) return;
@@ -94,6 +423,9 @@ function emptyHTML(icon, text) {
 
 // ── API helper ───────────────────────────────────────────
 async function api(path, opts = {}) {
+  if (PREVIEW.enabled) {
+    return previewApi(path, opts);
+  }
   const resp = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...opts.headers },
     ...opts,
@@ -117,6 +449,56 @@ function toast(text, type = 'info') {
   el.innerHTML = `<span class="toast-icon">${icons[type] || '💡'}</span><span class="toast-text">${esc(text)}</span>`;
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => { el.classList.add('leaving'); setTimeout(() => el.remove(), 300); }, 4000);
+}
+
+// ── Hold-to-Confirm ──────────────────────────────────────
+// 長按 durationMs 後才觸發 callback；中途放開則取消
+function attachHoldToConfirm(btn, durationMs, callback) {
+  let timer = null;
+  let startText = btn.textContent;
+
+  const cancel = () => {
+    clearTimeout(timer);
+    timer = null;
+    btn.classList.remove('holding');
+    btn.style.removeProperty('--hold-duration');
+    btn.textContent = startText;
+    btn.disabled = false;
+  };
+
+  const start = (e) => {
+    if (btn.disabled) return;
+    e.preventDefault();
+    startText = btn.textContent;
+    btn.style.setProperty('--hold-duration', `${durationMs / 1000}s`);
+    btn.classList.add('holding');
+    btn.textContent = '⏳ 持續按住...';
+    timer = setTimeout(() => {
+      btn.classList.remove('holding');
+      btn.textContent = startText;
+      timer = null;
+      callback();
+    }, durationMs);
+  };
+
+  btn.addEventListener('mousedown', start);
+  btn.addEventListener('touchstart', start, { passive: false });
+  btn.addEventListener('mouseup', cancel);
+  btn.addEventListener('mouseleave', cancel);
+  btn.addEventListener('touchend', cancel);
+  btn.addEventListener('touchcancel', cancel);
+}
+
+// ── Threshold natural-lang hint ──────────────────────────
+function thresholdHintText(value, windowSeconds) {
+  const v = Number(value) || 1;
+  const w = Number(windowSeconds) || 300;
+  const timeStr = w < 60
+    ? `${w} 秒`
+    : w % 60 === 0
+      ? `${w / 60} 分鐘`
+      : `${Math.floor(w / 60)} 分 ${w % 60} 秒`;
+  return `目前設定：每${timeStr}出現${v}次即觸發`;
 }
 
 // ── Confirm modal ────────────────────────────────────────
@@ -266,6 +648,7 @@ function renderApp() {
 // ── Navigation ───────────────────────────────────────────
 function navigate(page) {
   if (_devPoller && page !== 'developer') { clearInterval(_devPoller); _devPoller = null; }
+  if (page !== 'recovery') { _clearRecoveryDefenseTimer(); }
   S.page = page;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
@@ -374,7 +757,17 @@ function attachLogHandlers(el) {
 }
 
 // ── Page: recovery ───────────────────────────────────────
+let _recoveryDefenseTimer = null;
+
+function _clearRecoveryDefenseTimer() {
+  if (_recoveryDefenseTimer !== null) {
+    clearInterval(_recoveryDefenseTimer);
+    _recoveryDefenseTimer = null;
+  }
+}
+
 async function pageRecovery(el) {
+  _clearRecoveryDefenseTimer();
   try {
     const [data, defenseResp] = await Promise.all([
       api(`/api/guilds/${S.guild}/recovery-requests`),
@@ -389,11 +782,11 @@ async function pageRecovery(el) {
       <div class="page-header"><h2>復原管理</h2><button class="btn btn-ghost btn-sm" id="refreshRecovery">↻ 重新整理</button></div>
       <div class="manual-section" style="margin-bottom:1.2rem;">
         <div class="info">
-          <h3>${defense.enabled ? '🛡️ 防禦系統目前啟用中' : '🛑 防禦系統目前暫停中'}</h3>
-          <p>
+          <h3 id="defenseStatusTitle">${defense.enabled ? '🛡️ 防禦系統目前啟用中' : '🛑 防禦系統目前暫停中'}</h3>
+          <p id="defenseStatusDesc">
             ${defense.enabled
               ? '異常偵測與自動防禦正在運作。'
-              : `預計 ${fmtDuration(defense.remaining_seconds)} 後自動恢復。${defense.disabled_until ? `（${fmtTime(defense.disabled_until)}）` : ''}`}
+              : `預計 <span id="defenseCountdown">${fmtDuration(defense.remaining_seconds)}</span> 後自動恢復。${defense.disabled_until ? `（${fmtTime(defense.disabled_until)}）` : ''}`}
           </p>
         </div>
         <button class="btn ${defense.enabled ? 'btn-danger' : 'btn-success'}" id="toggleDefenseRecovery">
@@ -416,6 +809,23 @@ async function pageRecovery(el) {
         ${history.length ? history.map(renderHistoryCard).join('') : emptyHTML('📭', '還沒有復原記錄')}
       </div>`;
 
+    // 若防禦系統暫停中，啟動本地倒數計時器（每秒更新）
+    if (!defense.enabled && defense.remaining_seconds > 0) {
+      let remaining = defense.remaining_seconds;
+      _recoveryDefenseTimer = setInterval(() => {
+        remaining -= 1;
+        const countdownEl = el.querySelector('#defenseCountdown');
+        if (!countdownEl) { _clearRecoveryDefenseTimer(); return; }
+        if (remaining <= 0) {
+          _clearRecoveryDefenseTimer();
+          // 倒數歸零後重新拉取頁面，確認是否已自動恢復
+          pageRecovery(el);
+        } else {
+          countdownEl.textContent = fmtDuration(remaining);
+        }
+      }, 1000);
+    }
+
     el.querySelector('#refreshRecovery')?.addEventListener('click', () => pageRecovery(el));
     el.querySelector('#toggleDefenseRecovery')?.addEventListener('click', async () => {
       if (defense.enabled) {
@@ -424,12 +834,16 @@ async function pageRecovery(el) {
         await enableDefense(el, pageRecovery);
       }
     });
-    el.querySelector('#manualRecovery')?.addEventListener('click', () => doManualRecovery(el));
+    // manual recovery 改為長按確認
+    const manualBtn = el.querySelector('#manualRecovery');
+    if (manualBtn) attachHoldToConfirm(manualBtn, 2000, () => doManualRecovery(el));
+
+    // approve / reject 改為長按確認
     el.querySelectorAll('[data-approve]').forEach(btn => {
-      btn.addEventListener('click', () => doApprove(btn.dataset.approve, el));
+      attachHoldToConfirm(btn, 1500, () => doApprove(btn.dataset.approve, el));
     });
     el.querySelectorAll('[data-reject]').forEach(btn => {
-      btn.addEventListener('click', () => doReject(btn.dataset.reject, el));
+      attachHoldToConfirm(btn, 1200, () => doReject(btn.dataset.reject, el));
     });
   } catch (e) {
     if (e.message === 'unauthorized') return;
@@ -448,8 +862,8 @@ function renderPendingCard(r) {
         <div class="request-meta">事件數 ${r.event_count} · ${fmtTime(r.created_at)}</div>
       </div>
       <div class="request-actions">
-        <button class="btn btn-success btn-sm" data-approve="${r.id}">✅ 核准</button>
-        <button class="btn btn-ghost btn-sm" data-reject="${r.id}">❌ 拒絕</button>
+        <button class="btn btn-success btn-sm btn-hold" data-approve="${r.id}" style="--hold-duration:1.5s" title="長按 1.5 秒確認核准">✅ 長按核准</button>
+        <button class="btn btn-ghost btn-sm btn-hold" data-reject="${r.id}" style="--hold-duration:1.2s" title="長按 1.2 秒確認拒絕">❌ 長按拒絕</button>
       </div>
     </div>`;
 }
@@ -539,6 +953,7 @@ async function pageThresholds(el) {
           <span class="unit">秒</span>
           <span class="unit" style="margin-left:.25rem;">= ${fmtWindow(t.window_seconds)}</span>
         </div>
+        <div class="threshold-hint" data-hint="${esc(t.event_type)}">${thresholdHintText(t.value, t.window_seconds)}</div>
       </div>`).join('');
 
     el.innerHTML = `
@@ -571,6 +986,26 @@ async function pageThresholds(el) {
       }
     });
     el.querySelector('#saveThresholds')?.addEventListener('click', () => saveThresholds(el));
+
+    // 即時更新自然語言提示
+    el.querySelectorAll('.threshold-card').forEach(card => {
+      const updateHint = () => {
+        const evInp = card.querySelector('input[data-event]');
+        const minInp = card.querySelector('input[data-window-min]');
+        const secInp = card.querySelector('input[data-window-sec]');
+        const hint = card.querySelector('.threshold-hint');
+        if (!evInp || !hint) return;
+        const v = parseInt(evInp.value, 10) || 1;
+        const mins = parseInt(minInp?.value || '0', 10) || 0;
+        const secs = parseInt(secInp?.value || '0', 10) || 0;
+        const ws = (mins * 60) + secs;
+        hint.textContent = thresholdHintText(v, ws || 300);
+        hint.classList.add('highlight');
+        clearTimeout(hint._hTimer);
+        hint._hTimer = setTimeout(() => hint.classList.remove('highlight'), 1200);
+      };
+      card.querySelectorAll('input').forEach(inp => inp.addEventListener('input', updateHint));
+    });
   } catch (e) {
     if (e.message === 'unauthorized') return;
     el.innerHTML = emptyHTML('😴', randomError());
@@ -730,6 +1165,12 @@ async function pageDeveloper(el) {
           <button class="btn btn-ghost btn-sm" id="devR2GuildClear" ${S.guild ? '' : 'disabled'}>清除覆寫</button>
         </div>
       </div>
+      <div style="margin-top:.8rem;display:grid;gap:.4rem;font-size:.86rem">
+        <div style="display:flex;justify-content:space-between;gap:1rem"><span style="color:var(--text-3)">總配額</span><strong id="devR2TotalQuota">—</strong></div>
+        <div style="display:flex;justify-content:space-between;gap:1rem"><span style="color:var(--text-3)">目前配額</span><strong id="devR2CurrentQuota">—</strong></div>
+        <div style="display:flex;justify-content:space-between;gap:1rem"><span style="color:var(--text-3)">剩餘配額</span><strong id="devR2RemainingQuota">—</strong></div>
+        <div id="devR2QuotaStatus" style="font-size:.8rem;color:var(--text-3)">等待 daemon 資料...</div>
+      </div>
       <div id="devR2QuotaResult" style="margin-top:.65rem;font-size:.82rem;color:var(--text-3)">—</div>
     </div>`;
 
@@ -791,10 +1232,23 @@ async function pageDeveloper(el) {
       </table>
     </div>`;
 
-    // ── Redis RAM ────────────────────────────────────────
+    // ── System Health Score ──────────────────────────────
     html += `
     <div class="section">
-      <div class="section-title">🗄️ Redis 記憶體</div>
+      <div class="section-title">💠 系統健康指數</div>
+      <div id="devHealthScore" class="health-score-ring good">
+        <span class="score-num">—</span>
+        <div>
+          <div class="score-label">Health Score</div>
+          <div id="devHealthDetail" style="font-size:.72rem;color:var(--text-3);margin-top:.2rem">計算中...</div>
+        </div>
+      </div>
+    </div>`;
+
+    // ── Redis RAM dot-matrix ─────────────────────────────
+    html += `
+    <div class="section">
+      <div class="section-title">🗄️ Redis 記憶體（點陣矩陣）</div>
       <div id="devRedis" style="font-size:.9rem">—</div>
     </div>`;
 
@@ -806,14 +1260,14 @@ async function pageDeveloper(el) {
         <span style="font-size:.85rem;color:#4ade80">▲ 上傳：<strong id="devNetUp">—</strong></span>
         <span style="font-size:.85rem;color:#60a5fa">▼ 下載：<strong id="devNetDn">—</strong></span>
       </div>
-      <canvas id="devNetCanvas" width="600" height="120" style="width:100%;background:var(--surface-2);border-radius:.5rem"></canvas>
+      <canvas id="devNetCanvas" width="600" height="120" style="width:100%;background:rgba(4,10,18,0.8);border-radius:.5rem"></canvas>
     </div>`;
 
-    // ── Rate-limit 統計 ───────────────────────────────────
+    // ── Rate-limit 統計 terminal 樣式 ────────────────────
     html += `
     <div class="section">
-      <div class="section-title">📊 Rate-limit 統計（最近 5 分鐘）<span id="devRlTs" style="font-size:.75rem;color:var(--text-3);margin-left:.6rem"></span></div>
-      <div id="devRlBody">—</div>
+      <div class="section-title">📟 Rate-limit 統計（最近 5 分鐘）<span id="devRlTs" style="font-size:.75rem;color:var(--text-3);margin-left:.6rem"></span></div>
+      <div class="dev-terminal-block" id="devRlBody"><span class="term-dim">Loading...</span></div>
     </div>`;
 
     el.innerHTML = html;
@@ -879,6 +1333,11 @@ function _fmtBytes(b) {
   if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB/s';
   if (b >= 1024) return (b / 1024).toFixed(1) + ' KB/s';
   return b.toFixed(0) + ' B/s';
+}
+
+function _fmtGiB(v) {
+  const n = Number(v || 0);
+  return `${n.toFixed(3)} GB`;
 }
 
 function _devDrawChart(canvas) {
@@ -969,69 +1428,157 @@ function _devUpdateDOM(d) {
   }
   if (d.redis) {
     const el = document.getElementById('devRedis');
-    if (!el) return;
-    if (!d.redis.available) { el.innerHTML = '<span style="color:var(--text-3)">Redis 離線</span>'; return; }
-    const used = d.redis.used_memory_mb;
-    const max = d.redis.maxmemory_mb;
-    const pct = d.redis.used_memory_percent;
-    let bar = '';
-    if (max && pct !== null) {
-      const barPct = Math.min(100, pct);
-      const col = barPct > 85 ? 'var(--danger)' : barPct > 60 ? '#f59e0b' : '#4ade80';
-      bar = `<div style="margin:.5rem 0;height:8px;background:var(--border);border-radius:4px;overflow:hidden">
-        <div style="width:${barPct}%;height:100%;background:${col};transition:width .3s"></div>
-      </div>
-      <div style="font-size:.82rem;color:var(--text-3)">${used.toFixed(1)} MB / ${max.toFixed(1)} MB（${pct}%）</div>`;
-    } else {
-      bar = `<div style="font-size:.9rem">${used.toFixed(1)} MB <span style="color:var(--text-3)">（未設 maxmemory）</span></div>`;
+    if (el) {
+      if (!d.redis.available) {
+        el.innerHTML = '<span class="term-dim">Redis offline — no connection</span>';
+      } else {
+        const used = d.redis.used_memory_mb;
+        const max = d.redis.maxmemory_mb;
+        const pct = d.redis.used_memory_percent ?? 0;
+        const barPct = Math.min(100, Math.round(pct));
+        const dotTotal = 60;
+        const dotFilled = Math.round((barPct / 100) * dotTotal);
+        const dotCls = barPct > 85 ? 'danger' : barPct > 60 ? 'warn' : 'filled';
+        const dots = Array.from({ length: dotTotal }, (_, i) =>
+          `<span class="dot${i < dotFilled ? ' ' + dotCls : ''}"></span>`
+        ).join('');
+        el.innerHTML = `
+          <div style="font-size:.8rem;color:var(--text-3);margin-bottom:.35rem;font-family:var(--font-mono)">
+            used <span style="color:#e2e8f0">${used.toFixed(1)} MB</span> /
+            max <span style="color:#e2e8f0">${max ? max.toFixed(1) + ' MB' : 'unlimited'}</span>
+            — <span style="color:${barPct > 85 ? 'var(--red)' : barPct > 60 ? 'var(--yellow)' : '#4ade80'}">${barPct}%</span>
+          </div>
+          <div class="dot-matrix">${dots}</div>`;
+      }
     }
-    el.innerHTML = bar;
   }
+
+  // System Health Score
+  _devUpdateHealthScore(d);
+
+  if (d.r2_usage) {
+    set('devR2TotalQuota', _fmtGiB(d.r2_usage.total_quota_gb));
+    set('devR2CurrentQuota', _fmtGiB(d.r2_usage.current_quota_gb));
+    set('devR2RemainingQuota', _fmtGiB(d.r2_usage.remaining_quota_gb));
+
+    const statusEl = document.getElementById('devR2QuotaStatus');
+    if (!statusEl) return;
+
+    if (!d.r2_usage.available) {
+      statusEl.textContent = d.r2_usage.error ? `daemon 無法取得：${d.r2_usage.error}` : 'daemon 未啟用';
+      statusEl.style.color = 'var(--text-3)';
+      return;
+    }
+
+    if (d.r2_usage.locked) {
+      statusEl.textContent = `已鎖定：${d.r2_usage.lock_reason || '達到上限'}`;
+      statusEl.style.color = 'var(--danger)';
+    } else {
+      statusEl.textContent = '狀態正常';
+      statusEl.style.color = 'var(--text-3)';
+    }
+  }
+}
+
+// ── System Health Score algorithm ───────────────────────
+// 加權：Redis 延遲風險 40%、R2 剩餘配額 30%、RAM 使用率 30%
+function _devComputeHealthScore(d) {
+  let score = 100;
+  const reasons = [];
+
+  // Redis latency risk (inferred from memory pressure)
+  if (d.redis && d.redis.available) {
+    const redisPct = d.redis.used_memory_percent ?? 0;
+    if (redisPct > 90)       { score -= 40; reasons.push(`Redis ${redisPct}% — critical`); }
+    else if (redisPct > 75)  { score -= 20; reasons.push(`Redis ${redisPct}% — elevated`); }
+    else if (redisPct > 55)  { score -= 8;  reasons.push(`Redis ${redisPct}% — watch`); }
+  } else if (d.redis && !d.redis.available) {
+    score -= 40; reasons.push('Redis offline');
+  }
+
+  // R2 remaining quota
+  if (d.r2_usage && d.r2_usage.available) {
+    const r2Pct = d.r2_usage.total_quota_gb > 0
+      ? ((d.r2_usage.remaining_quota_gb / d.r2_usage.total_quota_gb) * 100)
+      : 100;
+    if (r2Pct < 5)        { score -= 30; reasons.push(`R2 < 5% left`); }
+    else if (r2Pct < 15)  { score -= 15; reasons.push(`R2 ${r2Pct.toFixed(0)}% left`); }
+    else if (r2Pct < 30)  { score -= 5;  reasons.push(`R2 ${r2Pct.toFixed(0)}% left`); }
+    if (d.r2_usage.locked) { score -= 20; reasons.push('R2 locked'); }
+  }
+
+  // RAM
+  if (d.system) {
+    const ramPct = d.system.ram_percent ?? 0;
+    if (ramPct > 92)       { score -= 30; reasons.push(`RAM ${ramPct}%`); }
+    else if (ramPct > 80)  { score -= 15; reasons.push(`RAM ${ramPct}%`); }
+    else if (ramPct > 70)  { score -= 5;  reasons.push(`RAM ${ramPct}%`); }
+  }
+
+  return { score: Math.max(0, Math.min(100, Math.round(score))), reasons };
+}
+
+function _devUpdateHealthScore(d) {
+  const ring = document.getElementById('devHealthScore');
+  const detail = document.getElementById('devHealthDetail');
+  if (!ring || !detail) return;
+
+  const { score, reasons } = _devComputeHealthScore(d);
+  const numEl = ring.querySelector('.score-num');
+  if (numEl) numEl.textContent = score;
+
+  ring.className = 'health-score-ring';
+  if (score >= 85)      ring.classList.add('good');
+  else if (score >= 60) ring.classList.add('warn');
+  else                  ring.classList.add('danger');
+
+  detail.textContent = reasons.length ? reasons.join(' · ') : 'All systems nominal';
 }
 
 function _devRenderRl(stat) {
   const body = document.getElementById('devRlBody');
   if (!body) return;
-  let h = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1rem;margin-bottom:1rem">
-    <div style="background:var(--surface-2);padding:1rem;border-radius:.5rem">
-      <div style="font-size:.8rem;color:var(--text-3)">總 429 次數</div>
-      <div style="font-size:1.5rem;font-weight:600;color:var(--danger)">${stat.total_429s || 0}</div>
-    </div>`;
-  if (stat.by_scope && Object.keys(stat.by_scope).length > 0) {
-    h += `<div style="background:var(--surface-2);padding:1rem;border-radius:.5rem">
-      <div style="font-size:.8rem;color:var(--text-3);margin-bottom:.4rem">Scope 分佈</div>`;
-    for (const [scope, count] of Object.entries(stat.by_scope))
-      h += `<div style="font-size:.85rem"><span style="color:var(--text-2)">${esc(scope)}:</span> <strong>${count}</strong></div>`;
-    h += `</div>`;
-  }
-  h += `</div>`;
-  if (stat.by_limit_key && Object.keys(stat.by_limit_key).length > 0) {
-    h += `<div style="font-size:.85rem;font-weight:600;margin:.4rem 0">🔑 按操作類型</div>
-      <table style="width:100%;font-size:.9rem;border-collapse:collapse">
-        <tr style="border-bottom:1px solid var(--border)">
-          <th style="text-align:left;padding:.4rem .6rem;color:var(--text-3)">操作類型</th>
-          <th style="text-align:right;padding:.4rem .6rem;color:var(--text-3)">429 次數</th></tr>`;
-    for (const [key, count] of Object.entries(stat.by_limit_key))
-      h += `<tr style="border-bottom:1px solid var(--border)">
-        <td style="padding:.4rem .6rem">${esc(key)}</td>
-        <td style="text-align:right;padding:.4rem .6rem"><strong>${count}</strong></td></tr>`;
-    h += `</table>`;
-  }
-  if (stat.by_bucket && Object.keys(stat.by_bucket).length > 0) {
-    h += `<div style="font-size:.85rem;font-weight:600;margin:.8rem 0 .4rem">🪣 熱點 Bucket（Top 10）</div><div style="display:grid;gap:.4rem">`;
-    for (const [bucket, count] of Object.entries(stat.by_bucket)) {
-      const pct = stat.total_429s > 0 ? Math.round((count / stat.total_429s) * 100) : 0;
-      h += `<div style="display:flex;align-items:center;gap:.8rem;padding:.4rem .6rem;background:var(--surface-2);border-radius:.3rem">
-        <span style="flex:1;font-family:monospace;font-size:.8rem;word-break:break-all">${esc(bucket)}</span>
-        <div style="width:60px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;flex-shrink:0">
-          <div style="width:${pct}%;height:100%;background:var(--danger)"></div></div>
-        <span style="font-size:.82rem;color:var(--text-2);min-width:50px;text-align:right">${count} (${pct}%)</span></div>`;
+
+  const now = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  const total = stat.total_429s || 0;
+
+  let lines = [];
+  lines.push(`<span class="term-dim">$ rate-limit-stats --window 5m  [${now}]</span>`);
+  lines.push(`<span class="term-label">total_429s</span>   <span class="${total > 0 ? 'term-err' : 'term-ok'}">${total}</span>`);
+  lines.push('');
+
+  if (stat.by_scope && Object.keys(stat.by_scope).length) {
+    lines.push('<span class="term-label">scope breakdown</span>');
+    for (const [scope, count] of Object.entries(stat.by_scope)) {
+      const bar = '█'.repeat(Math.min(20, count)) + '░'.repeat(Math.max(0, 20 - count));
+      lines.push(`  <span class="term-dim">${scope.padEnd(10)}</span> <span class="term-val">${bar}</span> <span class="term-warn">${count}</span>`);
     }
-    h += `</div>`;
+    lines.push('');
   }
-  body.innerHTML = h;
+
+  if (stat.by_limit_key && Object.keys(stat.by_limit_key).length) {
+    lines.push('<span class="term-label">by endpoint</span>');
+    for (const [key, count] of Object.entries(stat.by_limit_key)) {
+      const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+      lines.push(`  <span class="term-dim">${esc(key).padEnd(38)}</span> <span class="term-val">${String(count).padStart(4)}</span>  <span class="term-dim">(${pct}%)</span>`);
+    }
+    lines.push('');
+  }
+
+  if (stat.by_bucket && Object.keys(stat.by_bucket).length) {
+    lines.push('<span class="term-label">hot buckets (top 10)</span>');
+    const sorted = Object.entries(stat.by_bucket).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    for (const [bucket, count] of sorted) {
+      const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+      const filled = Math.round(pct / 5);
+      const miniBar = '[' + '|'.repeat(filled) + ' '.repeat(Math.max(0, 20 - filled)) + ']';
+      lines.push(`  <span class="term-dim">${esc(bucket).padEnd(30)}</span> <span class="term-warn">${miniBar}</span> <span class="term-val">${count}</span>`);
+    }
+  }
+
+  body.innerHTML = lines.map(l => l === '' ? '<br>' : `<div>${l}</div>`).join('');
   const ts = document.getElementById('devRlTs');
-  if (ts) ts.textContent = '更新於 ' + new Date().toLocaleTimeString();
+  if (ts) ts.textContent = now;
 }
 
 async function _devReload(el, cog) {
@@ -1217,6 +1764,9 @@ async function init() {
   try {
     const data = await api('/api/me');
     S.user = data;
+    if (PREVIEW.enabled) {
+      S.page = PREVIEW.page;
+    }
     const selectableGuilds = getSelectableGuilds(data);
     if (selectableGuilds.length > 0) {
       S.guild = selectableGuilds[0].id;

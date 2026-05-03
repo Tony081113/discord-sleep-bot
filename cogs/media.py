@@ -216,18 +216,24 @@ class MediaCog(commands.Cog, name="Media"):
             await interaction.followup.send("❌ 查詢失敗，請稍後再試。", ephemeral=True)
             return
 
-        total_gb: float = total_info.get("total_gb", 0)
+        total_gb: float = float(total_info.get("current_quota_gb", total_info.get("total_gb", 0)) or 0)
+        global_quota_gb: float = float(total_info.get("total_quota_gb", os.getenv("R2_GLOBAL_QUOTA_GB", "10")) or 0)
+        remaining_global_gb: float = float(total_info.get("remaining_quota_gb", max(0.0, global_quota_gb - total_gb)) or 0)
         locked: bool = total_info.get("locked", False)
         guild_mb: float = guild_info.get("used_mb", 0)
         quota_info = await get_guild_quota_details(guild_id)
         guild_quota_mb = float(quota_info["quota_mb"])
 
-        global_quota_gb = float(os.getenv("R2_GLOBAL_QUOTA_GB", "10"))
         color = discord.Color.red() if locked else discord.Color.blurple()
         embed = discord.Embed(title="☁️ R2 儲存空間使用量", color=color)
         embed.add_field(
             name="全域使用量",
             value=f"{total_gb:.3f} GB / {global_quota_gb:.0f} GB",
+            inline=False,
+        )
+        embed.add_field(
+            name="全域剩餘額度",
+            value=f"{remaining_global_gb:.3f} GB",
             inline=False,
         )
 

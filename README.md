@@ -49,6 +49,37 @@ python main.py
 
 啟動後可用 `/panel` 取得面板網址。
 
+## 面板預覽（Puppeteer）
+
+若要在不登入 Discord OAuth 的情況下直接查看 Web 面板樣貌，可使用本機預覽模式與 Puppeteer 截圖。
+
+### 1. 安裝預覽依賴
+
+```bash
+npm install
+```
+
+### 2. 產生預覽截圖
+
+```bash
+npm run panel:preview
+```
+
+預設會產出以下頁面的截圖到 `.panel-preview/`：
+
+- `overview`
+- `recovery`
+- `thresholds`
+- `developer`
+
+若只想看單一頁面：
+
+```bash
+npm run panel:preview -- --page recovery
+```
+
+這個模式會開啟 `/?preview=1&page=...`，前端會注入 mock API 資料，所以不需要啟動 bot 或完成 Discord 登入。
+
 ## 專案結構
 
 ```text

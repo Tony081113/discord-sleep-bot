@@ -37,6 +37,7 @@ from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
 from discord.ext import commands
 
+from mods.db_mod_daemon import get_daemon_bridge
 from mods.defense import (
     DefenseStorageError,
     DEFAULT_DISABLE_SECONDS,
@@ -392,12 +393,43 @@ def _session(req: web.Request) -> dict[str, Any] | None:
 # ═════════════════════════════════════════════════════════
 
 def _auth(fn):
-    """API 認證裝飾器：未登入直接回 401。"""
+    """API 認證裝飾器：未登入直接回 401；session 剩餘不到 1 天且有 refresh_token 時自動刷新。"""
     @functools.wraps(fn)
     async def wrapper(req: web.Request):
         s = _session(req)
         if not s:
             return web.json_response({"error": "Unauthorized"}, status=401)
+
+        # 在 session 有效期不到 24h 時，嘗試用 refresh_token 延長
+        refresh_tok = s.get("discord_refresh_token")
+        exp = s.get("exp", 0)
+        needs_refresh = refresh_tok and (exp - time.time() < 86400)
+
+        resp = None
+        if needs_refresh:
+            new_tok = await _refresh_discord_token(refresh_tok)
+            if new_tok and new_tok.get("access_token"):
+                # 更新 session 內的 refresh_token 和過期時間
+                new_s = {k: v for k, v in s.items() if k not in ("exp",)}
+                new_s["discord_refresh_token"] = new_tok.get("refresh_token", refresh_tok)
+                new_cookie = _sign(new_s)
+                # 把刷新後的 session 注入本次請求
+                s = _verify(new_cookie)  # re-parse to get updated exp
+                req["s"] = s
+                # 預備稍後把新 cookie 掛到 response
+                resp = await fn(req)
+                if hasattr(resp, "set_cookie"):
+                    resp.set_cookie(
+                        _COOKIE,
+                        new_cookie,
+                        max_age=_COOKIE_AGE,
+                        httponly=True,
+                        secure=_COOKIE_SECURE,
+                        samesite="Lax",
+                        path="/",
+                    )
+                return resp
+
         req["s"] = s
         return await fn(req)
     return wrapper
@@ -415,6 +447,103 @@ def _require_developer(fn):
         req["s"] = s
         return await fn(req)
     return wrapper
+
+# 對外別名：與 Prompt 提到的 @require_dev 一致
+require_dev = _require_developer
+
+
+def _has_manage_guild(bot: commands.Bot, guild_id: str, user_id: str) -> bool:
+    """判斷 user_id 在 guild_id 內是否擁有 MANAGE_GUILD 權限（透過 bot 快取）。
+
+    如果成員不在快取中（Intents 未開啟 members 或成員未上線），回傳 False。
+    開發者 ID 名單直接略過此檢查，由 _require_approver 處理。
+    """
+    if _is_developer_user_id(user_id):
+        return True
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        return False
+    member = guild.get_member(int(user_id))
+    if member is None:
+        return False
+    return member.guild_permissions.manage_guild
+
+
+async def _refresh_discord_token(refresh_token: str) -> dict | None:
+    """向 Discord 請求使用新的 refresh_token 更新 access token。
+
+    成功時回傳含 access_token / refresh_token 的 dict；失敗回傳 None。
+    """
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(
+            _DISCORD_TOKEN,
+            data={
+                "client_id": _CLIENT_ID,
+                "client_secret": _CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as r:
+            if r.status != 200:
+                logger.warning("Discord token refresh failed: HTTP %d", r.status)
+                return None
+            return await r.json()
+
+
+def _sleep_error_page(title: str, subtitle: str, status: int) -> web.Response:
+    """產生睡眠主題 HTML 錯誤頁面（用於 401/403 等前端錯誤）。"""
+    html = f"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title} — SleepBot</title>
+  <style>
+    :root {{ --bg: #0B0E14; --purple: #A78BFA; --text: #8fa3be; --dim: #5a7090; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: 'Inter', system-ui, sans-serif;
+      background: radial-gradient(ellipse at 30% 40%, rgba(167,139,250,.08), transparent 60%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }}
+    .card {{
+      max-width: 360px;
+      padding: 3rem 2.5rem;
+      background: rgba(20,28,47,.65);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(167,139,250,.1);
+      border-radius: 18px;
+      box-shadow: 0 0 40px rgba(167,139,250,.1);
+    }}
+    .moon {{ font-size: 3rem; margin-bottom: .8rem; opacity: .85; }}
+    h1 {{ font-size: 1.6rem; color: var(--purple); margin-bottom: .5rem; }}
+    p {{ font-size: .9rem; line-height: 1.6; color: var(--dim); }}
+    a {{
+      display: inline-block; margin-top: 1.6rem;
+      color: var(--purple); font-size: .85rem;
+      text-decoration: none; border-bottom: 1px solid rgba(167,139,250,.3);
+      transition: border-color .3s;
+    }}
+    a:hover {{ border-color: var(--purple); }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="moon">🌙</div>
+    <h1>{title}</h1>
+    <p>{subtitle}</p>
+    <a href="/">回到首頁</a>
+  </div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type="text/html", status=status)
 
 
 async def _handle_404(req: web.Request) -> web.Response:
@@ -555,6 +684,7 @@ async def _require_approver(
 ) -> tuple[str, None] | tuple[None, web.Response]:
     """驗證 bot 在該 guild 且請求者為核准者。
 
+    額外檢查：非開發者需在該 guild 擁有 MANAGE_GUILD 權限。
     回傳 (uid, None) 代表通過；回傳 (None, error_response) 代表拒絕。
     """
     bot = req.app["bot"]
@@ -562,8 +692,18 @@ async def _require_approver(
         return None, _gone()
 
     uid = str(req["s"].get("id") or "")
-    if _is_developer_user_id(uid):
+    is_dev = _is_developer_user_id(uid)
+
+    # 開發者直接放行
+    if is_dev:
         return uid, None
+
+    # 非開發者：先驗 MANAGE_GUILD，再驗 recovery_approvers 資料表
+    if not _has_manage_guild(bot, guild_id, uid):
+        return None, web.json_response(
+            {"error": "你在此伺服器沒有「管理伺服器」權限"},
+            status=403,
+        )
 
     result = await _check_approver(req, guild_id)
     if result == "GONE":
@@ -630,6 +770,7 @@ async def _auth_login(req: web.Request) -> web.Response:
         httponly=True,
         secure=_COOKIE_SECURE,
         samesite="Lax",
+        path="/",
     )
     return resp
 
@@ -687,6 +828,7 @@ async def _auth_callback(req: web.Request) -> web.Response:
         "id": uid,
         "username": u.get("global_name") or u.get("username", ""),
         "avatar": avatar_url,
+        "discord_refresh_token": tok.get("refresh_token"),
     })
 
     resp = web.HTTPFound("/")
@@ -699,7 +841,7 @@ async def _auth_callback(req: web.Request) -> web.Response:
         samesite="Lax",
         path="/",
     )
-    resp.del_cookie("_st")
+    resp.del_cookie("_st", path="/")
     return resp
 
 
@@ -1560,6 +1702,26 @@ async def _api_dev_system_stats(req: web.Request) -> web.Response:
         except Exception as redis_exc:  # noqa: BLE001
             redis_info = {"available": False, "error": str(redis_exc)}
 
+        # ── R2 配額使用狀態（daemon）────────────────────
+        r2_usage: dict[str, Any] = {"available": False}
+        try:
+            bridge = get_daemon_bridge()
+            if bridge.enabled():
+                usage = await bridge.get_usage(force=False)
+                r2_usage = {
+                    "available": True,
+                    "total_quota_bytes": int(usage.get("total_quota_bytes", 0) or 0),
+                    "current_quota_bytes": int(usage.get("current_quota_bytes", usage.get("total_bytes", 0)) or 0),
+                    "remaining_quota_bytes": int(usage.get("remaining_quota_bytes", 0) or 0),
+                    "total_quota_gb": float(usage.get("total_quota_gb", 0) or 0),
+                    "current_quota_gb": float(usage.get("current_quota_gb", usage.get("total_gb", 0)) or 0),
+                    "remaining_quota_gb": float(usage.get("remaining_quota_gb", 0) or 0),
+                    "locked": bool(usage.get("locked", False)),
+                    "lock_reason": str(usage.get("lock_reason", "") or ""),
+                }
+        except Exception as r2_exc:  # noqa: BLE001
+            r2_usage = {"available": False, "error": str(r2_exc)}
+
         return web.json_response({
             "success": True,
             "timestamp": now_ts,
@@ -1580,6 +1742,7 @@ async def _api_dev_system_stats(req: web.Request) -> web.Response:
                 "bytes_recv_total": net_now.bytes_recv,
             },
             "redis": redis_info,
+            "r2_usage": r2_usage,
         })
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to get system stats: %s", exc, exc_info=True)

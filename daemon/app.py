@@ -189,6 +189,10 @@ class R2QuotaManager:
     def lock_reason(self) -> str:
         return self._lock_reason
 
+    @property
+    def global_quota_bytes(self) -> int:
+        return self._global_quota_bytes
+
     def _list_all_objects(self, prefix: str = "") -> int:
         """Synchronously list all objects and return total size in bytes."""
         total = 0
@@ -312,9 +316,19 @@ async def init_db(request: web.Request) -> web.Response:
 async def get_usage(request: web.Request) -> web.Response:
     """Return total R2 usage and lock status."""
     qm: R2QuotaManager = request.app["quota_manager"]
-    total = await qm.get_total_usage_bytes(force=True)
+    force = str(request.query.get("force", "")).strip().lower() in {"1", "true", "yes", "on"}
+    total = await qm.get_total_usage_bytes(force=force)
+    quota_bytes = qm.global_quota_bytes
+    remaining_bytes = max(0, quota_bytes - total)
     return web.json_response({
         "ok": True,
+        "force": force,
+        "total_quota_bytes": quota_bytes,
+        "total_quota_gb": round(quota_bytes / _BYTES_PER_GB, 4),
+        "current_quota_bytes": total,
+        "current_quota_gb": round(total / _BYTES_PER_GB, 4),
+        "remaining_quota_bytes": remaining_bytes,
+        "remaining_quota_gb": round(remaining_bytes / _BYTES_PER_GB, 4),
         "total_bytes": total,
         "total_gb": round(total / _BYTES_PER_GB, 4),
         "locked": qm.locked,

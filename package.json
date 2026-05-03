@@ -1,0 +1,12 @@
+{
+  "name": "discord-sleep-bot-panel-preview",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local Puppeteer preview runner for the SleepBot web panel",
+  "scripts": {
+    "panel:preview": "node scripts/panel-preview.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.9.0"
+  }
+}

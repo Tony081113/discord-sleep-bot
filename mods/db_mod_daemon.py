@@ -168,9 +168,10 @@ class DaemonBridge:
             request_payload["guild_quota_mb"] = guild_quota_mb
         return await self._post_json("/v1/r2/put", request_payload)
 
-    async def get_usage(self) -> dict[str, Any]:
-        """Return total R2 usage and lock status from daemon."""
-        return await self._get_json("/v1/r2/usage")
+    async def get_usage(self, *, force: bool = False) -> dict[str, Any]:
+        """Return total R2 usage and quota status from daemon."""
+        path = "/v1/r2/usage?force=1" if force else "/v1/r2/usage"
+        return await self._get_json(path)
 
     async def get_guild_usage(self, guild_id: str) -> dict[str, Any]:
         """Return R2 usage for a specific guild."""
